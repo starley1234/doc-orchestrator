@@ -24,6 +24,8 @@ def validate_invoice_math(data: UpdSchema | InvoiceSchema) -> list[str]:
             )
 
     rows_total = sum((row.row_total for row in data.items), Decimal(0))
-    if abs(rows_total - data.document_total) > TOLERANCE:
-        errors.append(f"Сумма по строкам ({rows_total:.2f}) != Итого ({data.document_total:.2f})")
+    if abs(rows_total - data.total_with_vat) > TOLERANCE:
+        errors.append(
+            f"Сумма по строкам ({rows_total:.2f}) != Итого по документу ({data.total_with_vat:.2f})"
+        )
     return errors

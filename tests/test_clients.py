@@ -7,14 +7,13 @@ import httpx
 import pytest
 
 from app.clients.base import EngineClient, MarkdownReply
-from app.clients.dlp import DlpClient
 from app.clients.docling import DoclingClient
 from app.clients.mineru import MineruClient
 from app.clients.paddle import PaddleClient
-from app.clients.vlm_gateway import VlmGatewayClient
+from app.clients.vlm import VlmClient
 from app.config import Settings
 from app.core.errors import EngineError
-from mocks.main import MERMAID, MockState
+from mocks.main import MERMAID, SEAL_TEXT, MockState
 
 PDF = b"%PDF-1.7 test"
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -25,25 +24,47 @@ def client_with(handler) -> EngineClient:
     return EngineClient(httpx.AsyncClient(transport=httpx.MockTransport(handler)), "http://engine/api/")
 
 
+def vlm_with(handler, model: str = "qwen3-vl:4b-instruct-q8_0") -> VlmClient:
+    return VlmClient(
+        httpx.AsyncClient(transport=httpx.MockTransport(handler)), "http://ollama:11434/", model, 8192
+    )
+
+
 # --- Ответы движков -----------------------------------------------------------------------
 
 
-async def test_docling_convert(mock_http: httpx.AsyncClient, settings: Settings):
-    markdown = await DoclingClient(mock_http, settings.docling_url).convert(PDF, "report.pdf")
-    assert markdown.startswith("# Документ (Docling)")
+async def test_docling_convert_sends_file_with_its_name(mock_http: httpx.AsyncClient, settings: Settings):
+    markdown = await DoclingClient(mock_http, settings.docling_url).convert(PDF, "договор.pdf")
+    assert markdown == "# Цифровой документ (договор.pdf)\nТаблица и текст из Docling."
 
 
 async def test_mineru_extract_decodes_figures(mock_http: httpx.AsyncClient, settings: Settings):
-    reply = await MineruClient(mock_http, settings.mineru_url).extract(PDF, "scan.pdf")
+    mineru = MineruClient(mock_http, settings.mineru_url)
+    await mineru.load()
 
-    assert "![fig_1](fig_1.png)" in reply.markdown
-    assert [figure.name for figure in reply.images] == ["fig_1.png"]
-    assert reply.images[0].data.startswith(PNG_SIGNATURE)  # base64 уже раскодирован в байты
+    reply = await mineru.extract(PDF, "scan.pdf")
+
+    assert "![Схема](fig_1.png)" in reply.markdown
+    assert list(reply.figures) == ["fig_1.png"]
+    assert reply.figures["fig_1.png"].startswith(PNG_SIGNATURE)  # base64 уже раскодирован в байты
+
+
+async def test_mineru_reply_without_figures():
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"markdown": "Текст"}))
+    )
+    reply = await MineruClient(http, "http://mineru").extract(PDF, "scan.pdf")
+    assert (reply.markdown, reply.figures) == ("Текст", {})
 
 
 async def test_paddle_extract(mock_http: httpx.AsyncClient, settings: Settings):
-    markdown = await PaddleClient(mock_http, settings.paddle_url).extract(PDF, "upd.pdf")
+    paddle = PaddleClient(mock_http, settings.paddle_url)
+    await paddle.load()
+
+    markdown = await paddle.extract(PDF, "upd.pdf")
+
     assert "| № | Наименование |" in markdown
+    assert SEAL_TEXT in markdown
 
 
 async def test_gpu_engine_load_and_unload(mock_http: httpx.AsyncClient, settings: Settings, mock: MockState):
@@ -53,76 +74,73 @@ async def test_gpu_engine_load_and_unload(mock_http: httpx.AsyncClient, settings
     assert mock.loaded == {"paddle"}
     await paddle.unload()
     assert mock.loaded == set()
-
-
-async def test_original_filename_reaches_engine(mock_http: httpx.AsyncClient, settings: Settings):
-    # Мок дописывает секрет в текст файлов с «secret» в имени — значит, имя дошло, включая кириллицу
-    markdown = await DoclingClient(mock_http, settings.docling_url).convert(PDF, "договор_secret.pdf")
-    assert "SECRET_TOKEN" in markdown
-
-
-async def test_dlp_inspect(mock_http: httpx.AsyncClient, settings: Settings):
-    dlp = DlpClient(mock_http, settings.dlp_url)
-
-    masked = await dlp.inspect("Токен SECRET_TOKEN")
-    clean = await dlp.inspect("Обычный текст")
-
-    assert (masked.text, masked.masked) == ("Токен [REDACTED]", True)
-    assert (clean.text, clean.masked) == ("Обычный текст", False)
+    assert mock.calls == ["paddle/load", "paddle/unload"]
 
 
 async def test_vlm_chat(mock_http: httpx.AsyncClient, settings: Settings, mock: MockState):
-    vlm = VlmGatewayClient(mock_http, settings.vlm_gateway_url, settings.vlm_model)
+    vlm = VlmClient(mock_http, settings.ollama_url, settings.vlm_model, settings.vlm_num_ctx)
 
     assert await vlm.chat("Опиши схему") == MERMAID
     assert mock.prompts == ["Опиши схему"]
 
 
-async def test_vlm_request_carries_model_image_and_schema():
+async def test_vlm_request_follows_ollama_chat_contract():
     sent: list[dict] = []
 
-    def gateway(request: httpx.Request) -> httpx.Response:
+    def ollama(request: httpx.Request) -> httpx.Response:
         sent.append({"url": str(request.url), **json.loads(request.content)})
-        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "{}"}}]})
+        return httpx.Response(200, json={"message": {"role": "assistant", "content": "{}"}, "done": True})
 
-    http = httpx.AsyncClient(transport=httpx.MockTransport(gateway))
-    vlm = VlmGatewayClient(http, "http://gateway/", "qwen3-vl:8b")
-    schema = {"title": "DrawingStampSchema", "type": "object"}
+    schema = {"title": "DrawingStampCore", "type": "object"}
 
-    assert await vlm.chat("Прочитай штамп", image_png=PNG_SIGNATURE, schema=schema) == "{}"
+    assert await vlm_with(ollama).chat("Прочитай штамп", image_png=PNG_SIGNATURE, schema=schema) == "{}"
 
-    (body,) = sent
-    text, image = body["messages"][0]["content"]
-    assert body["url"] == "http://gateway/v1/chat/completions"
-    assert body["model"] == "qwen3-vl:8b"
-    assert body["format"] == schema
-    assert text == {"type": "text", "text": "Прочитай штамп"}
-    assert image["image_url"]["url"] == "data:image/png;base64," + base64.b64encode(PNG_SIGNATURE).decode()
+    assert sent == [
+        {
+            "url": "http://ollama:11434/api/chat",
+            "model": "qwen3-vl:4b-instruct-q8_0",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Прочитай штамп",
+                    "images": [base64.b64encode(PNG_SIGNATURE).decode()],  # без префикса data:image/...
+                }
+            ],
+            "format": schema,
+            "stream": False,
+            "options": {"num_ctx": 8192, "temperature": 0.0},
+        }
+    ]
 
 
-async def test_vlm_request_without_schema_has_no_format_field():
+async def test_vlm_request_without_image_and_schema():
     sent: list[dict] = []
 
-    def gateway(request: httpx.Request) -> httpx.Response:
+    def ollama(request: httpx.Request) -> httpx.Response:
         sent.append(json.loads(request.content))
-        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+        return httpx.Response(200, json={"message": {"content": "ok"}})
 
-    vlm = VlmGatewayClient(
-        httpx.AsyncClient(transport=httpx.MockTransport(gateway)), "http://gateway", "qwen3-vl"
-    )
-    await vlm.chat("Опиши схему")
+    await vlm_with(ollama, model="qwen3-vl:8b-instruct").chat("Опиши схему")
 
     assert "format" not in sent[0]
-    assert sent[0]["messages"][0]["content"] == [{"type": "text", "text": "Опиши схему"}]
+    assert sent[0]["model"] == "qwen3-vl:8b-instruct"
+    assert sent[0]["messages"] == [{"role": "user", "content": "Опиши схему"}]
+
+
+def test_default_vlm_settings_match_the_spec():
+    settings = Settings(_env_file=None)
+
+    assert settings.ollama_url == "http://mock-engines:8001"
+    assert settings.vlm_model == "qwen3-vl:4b-instruct-q8_0"
+    assert settings.vlm_num_ctx == 8192
+    assert settings.http_timeout_sec == 300
 
 
 # --- Сбои ---------------------------------------------------------------------------------
 
 
 async def test_http_error_becomes_engine_error(mock_http: httpx.AsyncClient, settings: Settings):
-    await PaddleClient(mock_http, settings.paddle_url).load()
-
-    with pytest.raises(EngineError, match=r"MinerU вернул HTTP 500: .*Out Of Memory \(Simulated\)"):
+    with pytest.raises(EngineError, match=r"MinerU вернул HTTP 500: .*MinerU not loaded"):
         await MineruClient(mock_http, settings.mineru_url).extract(PDF, "scan.pdf")
 
 
@@ -144,19 +162,24 @@ async def test_connection_failure_becomes_engine_error():
 
 @pytest.mark.parametrize("body", ["<html>502 Bad Gateway</html>", '{"text": "нет поля markdown"}', ""])
 async def test_malformed_reply_becomes_engine_error(body: str):
-    with pytest.raises(EngineError, match="некорректный ответ"):
-        await client_with(lambda request: httpx.Response(200, text=body))._post_json(
-            "/convert", MarkdownReply
-        )
-
-
-async def test_vlm_reply_without_choices_is_rejected():
-    http = httpx.AsyncClient(
-        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"choices": []}))
-    )
+    client = client_with(lambda request: httpx.Response(200, text=body))
 
     with pytest.raises(EngineError, match="некорректный ответ"):
-        await VlmGatewayClient(http, "http://gateway", "qwen3-vl").chat("Опиши схему")
+        await client._post_json("/convert", MarkdownReply)
+
+
+@pytest.mark.parametrize("reply", [{"error": "model not found"}, {"message": {"role": "assistant"}}])
+async def test_vlm_reply_without_content_is_rejected(reply: dict):
+    with pytest.raises(EngineError, match="Qwen3-VL вернул некорректный ответ"):
+        await vlm_with(lambda request: httpx.Response(200, json=reply)).chat("Опиши схему")
+
+
+async def test_ollama_error_text_reaches_the_message():
+    def no_model(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": "model 'qwen3-vl:4b-instruct-q8_0' not found"})
+
+    with pytest.raises(EngineError, match=r"Qwen3-VL вернул HTTP 404: .*not found"):
+        await vlm_with(no_model).chat("Опиши схему")
 
 
 async def test_base_url_trailing_slash_is_ignored():

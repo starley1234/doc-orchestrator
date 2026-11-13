@@ -1,7 +1,7 @@
 """Очередь к видеокартам: распределённые локи в Redis и смена модели в VRAM.
 
 GPU 0 делят MinerU (основная модель) и PaddleOCR-VL — вместе они в 8 ГБ VRAM не помещаются.
-GPU 1 целиком занят Qwen3-VL, который обрабатывает строго один запрос за раз.
+GPU 1 целиком занят Qwen3-VL в Ollama, который обрабатывает строго один запрос за раз.
 """
 
 import asyncio
@@ -38,10 +38,10 @@ class GPUResourceManager:
     def __init__(self, redis: Redis, engines: Mapping[str, GpuEngineClient], settings: Settings) -> None:
         self._redis = redis
         self._engines = engines  # клиенты моделей GPU 0: {"mineru": ..., "paddle": ...}
-        self._lock_timeout = settings.gpu_lock_timeout_s
-        self._wait_timeout = settings.gpu_wait_timeout_s
-        self._idle_ttl = settings.paddle_idle_ttl_s
-        self._check_interval = settings.idle_check_interval_s
+        self._lock_timeout = settings.gpu_lock_timeout_sec
+        self._lock_wait = settings.gpu_lock_wait_sec
+        self._idle_ttl = settings.paddle_idle_ttl_sec
+        self._check_interval = settings.gpu0_check_interval_sec
         self._watcher: asyncio.Task[None] | None = None
 
     # --- Захват видеокарт -----------------------------------------------------------------
@@ -53,6 +53,10 @@ class GPUResourceManager:
             await self._switch_model(target_model)
             try:
                 yield
+            except EngineError:
+                # Движок мог перезапуститься и потерять модель: следующая задача загрузит её заново
+                await self._redis.set(KEY_ACTIVE_MODEL, "none")
+                raise
             finally:
                 await self._redis.set(KEY_LAST_USED, time.time())  # отсюда отсчитывается простой
 
@@ -81,7 +85,7 @@ class GPUResourceManager:
         if not await self._paddle_is_idle():
             return False
         with contextlib.suppress(GPUBusyError):  # GPU 0 занят — значит, он не простаивает
-            async with self._exclusive(LOCK_GPU0, wait=0):
+            async with self._exclusive(LOCK_GPU0, blocking=False):
                 if await self._paddle_is_idle():  # перепроверяем под локом: нас могли опередить
                     await self._switch_model(DEFAULT_MODEL)
                     return True
@@ -123,12 +127,14 @@ class GPUResourceManager:
         await self._redis.set(KEY_ACTIVE_MODEL, target)
 
     @asynccontextmanager
-    async def _exclusive(self, name: str, wait: float | None = None) -> AsyncIterator[None]:
-        """Распределённый лок Redis: дожидаемся очереди (не дольше wait секунд) и держим до выхода."""
-        wait = self._wait_timeout if wait is None else wait
-        lock = self._redis.lock(name, timeout=self._lock_timeout, blocking_timeout=wait)
-        if not await lock.acquire():
-            raise GPUBusyError(f"Видеокарта занята: очередь ({name}) не подошла за {wait:g} с")
+    async def _exclusive(self, name: str, blocking: bool = True) -> AsyncIterator[None]:
+        """Распределённый лок Redis: дожидаемся своей очереди и держим лок до выхода.
+
+        blocking=False — не ждать: если видеокарта занята, сразу GPUBusyError.
+        """
+        lock = self._redis.lock(name, timeout=self._lock_timeout, blocking_timeout=self._lock_wait)
+        if not await lock.acquire(blocking=blocking):
+            raise GPUBusyError(f"Видеокарта занята: очередь ({name}) не подошла за {self._lock_wait:g} с")
         keeper = asyncio.create_task(self._keep_alive(lock))
         try:
             yield

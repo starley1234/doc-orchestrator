@@ -1,29 +1,28 @@
-"""Пайплайн Б: документ -> строгий JSON с валидацией для 1С и Teamcenter."""
+"""Пайплайн Б: документ -> строгий JSON с валидацией для 1С:ДО и Teamcenter."""
 
 import json
-from collections.abc import Iterator
-from typing import Any
+from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
 from app.core.aio import run_cpu
-from app.core.classifier import RouteType, classify_file
-from app.core.errors import UnsupportedFileError
-from app.core.image_ops import crop_drawing_zones, first_page_image
+from app.core.classifier import RouteType
+from app.core.image_ops import crop_drawing_zones, first_page_image, smart_resize
 from app.pipelines.base import Engines
 from app.schemas.common import Counterparty, DocType, StructuredResult, TaskStatus, ValidationResult
-from app.schemas.contract import ContractSchema
-from app.schemas.drawing_stamp import DrawingStampSchema, TechRequirementsSchema
+from app.schemas.drawing_stamp import DrawingStampCore, DrawingStampSchema, TechRequirementsList
 from app.schemas.invoice import InvoiceSchema
 from app.schemas.upd import UpdSchema
 from app.validators.checksums import validate_bik, validate_inn, validate_kpp
 from app.validators.math_checks import validate_invoice_math
 
+ModelT = TypeVar("ModelT", bound=BaseModel)
+VlmRequest = tuple[type[BaseModel], str, bytes | None]  # схема ответа (поле format), промпт, картинка
+
 # Тип документа -> (схема JSON, название для промпта)
-DOCUMENTS: dict[DocType, tuple[type[BaseModel], str]] = {
+DOCUMENTS: dict[DocType, tuple[type[UpdSchema] | type[InvoiceSchema], str]] = {
     DocType.UPD: (UpdSchema, "УПД / счёт-фактура"),
     DocType.INVOICE: (InvoiceSchema, "счёт на оплату"),
-    DocType.CONTRACT: (ContractSchema, "договор"),
 }
 
 EXTRACT_PROMPT = (
@@ -46,18 +45,17 @@ class StructuredPipeline:
     def __init__(self, engines: Engines) -> None:
         self._engines = engines
 
-    async def run(self, file_bytes: bytes, filename: str, doc_type: DocType) -> StructuredResult:
-        """Извлекает JSON документа и проверяет его. Ошибки в данных — не сбой, а warnings."""
+    async def run(
+        self, file_bytes: bytes, filename: str, doc_type: DocType, has_seals: bool = False
+    ) -> StructuredResult:
+        """Извлекает JSON документа и проверяет его. Ошибки в данных — не сбой, а warnings.
+
+        has_seals=True отправляет скан в PaddleOCR-VL: он читает оттиски печатей и сложные таблицы.
+        """
         if doc_type is DocType.DRAWING:
             data, warnings = await self._extract_drawing(file_bytes, filename)
         else:
-            data, warnings = await self._extract_document(file_bytes, filename, doc_type)
-
-        # DLP post-check всего, что уходит наружу: предупреждения тоже цитируют значения из документа
-        checked, masked = await self._dlp_post_check({"data": data, "warnings": warnings})
-        data, warnings = checked["data"], checked["warnings"]
-        if masked:
-            warnings.append("DLP замаскировал часть данных: документ нужно проверить вручную")
+            data, warnings = await self._extract_document(file_bytes, filename, doc_type, has_seals)
         validation = ValidationResult(is_valid=not warnings, warnings=warnings)
         return StructuredResult(
             status=TaskStatus.COMPLETED, doc_type=doc_type, data=data, validation=validation
@@ -66,86 +64,78 @@ class StructuredPipeline:
     async def _extract_drawing(self, file_bytes: bytes, filename: str) -> tuple[dict[str, Any], list[str]]:
         """Чертёж: штамп и техтребования читаются с кропов двумя запросами к Qwen3-VL."""
         settings = self._engines.settings
-        if classify_file(file_bytes, filename, DocType.DRAWING) is not RouteType.DRAWING:
-            raise UnsupportedFileError("Чертёж принимается только как PDF или изображение")
         page = await run_cpu(first_page_image, file_bytes, settings.drawing_dpi)
         zones = await run_cpu(crop_drawing_zones, page, settings.max_pixels)
-
-        prompt = STAMP_PROMPT.format(filename=filename)
-        _, stamp, stamp_warnings = await self._ask_json(DrawingStampSchema, prompt, zones["stamp"])
-        prompt = TECH_REQ_PROMPT.format(filename=filename)
-        _, tech_req, tech_warnings = await self._ask_json(TechRequirementsSchema, prompt, zones["tech_req"])
-        return {**stamp, **tech_req}, stamp_warnings + tech_warnings
+        requests: list[VlmRequest] = [
+            (DrawingStampCore, STAMP_PROMPT.format(filename=filename), zones["stamp"]),
+            (TechRequirementsList, TECH_REQ_PROMPT.format(filename=filename), zones["tech_req"]),
+        ]
+        _, data, warnings = await self._ask_json(DrawingStampSchema, requests)
+        return data, warnings
 
     async def _extract_document(
-        self, file_bytes: bytes, filename: str, doc_type: DocType
+        self, file_bytes: bytes, filename: str, doc_type: DocType, has_seals: bool
     ) -> tuple[dict[str, Any], list[str]]:
-        """УПД, счёт или договор: OCR -> структурирование в Qwen3-VL -> валидаторы."""
-        engines = self._engines
+        """УПД или счёт: OCR -> сборка JSON в Qwen3-VL -> валидаторы."""
+        engines, settings = self._engines, self._engines.settings
         schema, doc_name = DOCUMENTS[doc_type]
 
-        # Шаг 1. OCR: точный текст и таблицы. Цифровой документ читает Docling, скан — PaddleOCR-VL
-        route = await run_cpu(classify_file, file_bytes, filename, doc_type)
-        if route in (RouteType.DIGITAL_OFFICE, RouteType.DIGITAL_PDF):
-            text = await engines.docling.convert(file_bytes, filename)
-        else:
-            text = await engines.paddle_ocr(file_bytes, filename)
+        # Шаг 1. Точный текст и таблицы. Скан УПД и документы с печатями читает PaddleOCR-VL
+        ocr = await engines.ocr(file_bytes, filename, use_paddle=has_seals or doc_type is DocType.UPD)
 
-        # Шаг 2. Структурирование: текст и картинка первой страницы -> JSON по схеме
-        image = None  # офисный файл в картинку не превращаем: модели хватит текста
-        if route is not RouteType.DIGITAL_OFFICE:
-            image = await run_cpu(first_page_image, file_bytes, engines.settings.render_dpi)
-        text = text[: engines.settings.vlm_max_text_chars]
+        # Шаг 2. Сборка JSON: текст и обзорная картинка первой страницы -> Qwen3-VL
+        image = None  # офисный или текстовый файл в картинку не превращаем: модели хватит текста
+        if ocr.route in (RouteType.DIGITAL_PDF, RouteType.SCAN_PDF, RouteType.SCAN_IMAGE):
+            page = await run_cpu(first_page_image, file_bytes, settings.overview_dpi)
+            image = await run_cpu(smart_resize, page, settings.max_pixels)
+        text = ocr.markdown[: settings.vlm_max_text_chars]
         prompt = EXTRACT_PROMPT.format(filename=filename, doc_name=doc_name, text=text)
-        document, data, warnings = await self._ask_json(schema, prompt, image)
+        document, data, warnings = await self._ask_json(schema, [(schema, prompt, image)])
 
-        # Шаг 3. Валидация: контрольные суммы реквизитов и арифметика
+        # Шаг 3. Пост-валидация: контрольные суммы реквизитов и арифметика
         if document:
             warnings += _validate(document)
+        if len(ocr.markdown) > len(text):
+            warnings.append(
+                f"Документ слишком длинный: модель получила только первые {len(text)} "
+                f"из {len(ocr.markdown)} символов текста"
+            )
         return data, warnings
 
     async def _ask_json(
-        self, schema: type[BaseModel], prompt: str, image: bytes | None
-    ) -> tuple[BaseModel | None, dict[str, Any], list[str]]:
-        """Запрос к Qwen3-VL с JSON Schema ответа.
+        self, schema: type[ModelT], requests: list[VlmRequest]
+    ) -> tuple[ModelT | None, dict[str, Any], list[str]]:
+        """Запросы к Qwen3-VL с JSON Schema ответа; ответы складываются в один объект schema.
 
         Возвращает документ (None, если ответ не подошёл под схему), данные для ответа и предупреждения.
         """
-        answer = await self._engines.ask_vlm(prompt, image, schema.model_json_schema())
+        raw: dict[str, Any] = {}
+        for part_schema, prompt, image in requests:
+            answer = await self._engines.ask_vlm(prompt, image, part_schema.model_json_schema())
+            try:
+                part = json.loads(answer)
+            except ValueError:
+                part = None
+            if not isinstance(part, dict):
+                return None, raw, ["Модель вернула не JSON-объект: данные извлечь не удалось"]
+            raw |= part
         try:
-            raw = json.loads(answer)
-        except ValueError:
-            return None, {}, ["Модель вернула не JSON: данные извлечь не удалось"]
-        try:
-            document = schema.model_validate_json(answer)
+            document = schema.model_validate(raw)
         except ValidationError as exc:
             # Ответ не подошёл под схему: отдаём данные как есть, причины — в предупреждения
-            return None, raw if isinstance(raw, dict) else {}, _schema_warnings(exc)
+            return None, raw, _schema_warnings(exc)
         return document, document.model_dump(mode="json"), []
-
-    async def _dlp_post_check(self, payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
-        """Маскирует секреты в JSON. Каждая строка проверяется отдельно, поэтому структура не страдает."""
-        checked = {text: await self._engines.dlp.inspect(text) for text in set(_strings(payload))}
-        if not any(result.masked for result in checked.values()):
-            return payload, False
-        return _replace_strings(payload, {text: result.text for text, result in checked.items()}), True
 
 
 # --- Валидация ----------------------------------------------------------------------------
 
 
-def _validate(document: BaseModel) -> list[str]:
-    """Пост-валидация документа: реквизиты сторон, БИК и сходимость сумм."""
-    warnings: list[str] = []
-    if isinstance(document, ContractSchema):
-        for number, party in enumerate(document.parties, start=1):
-            warnings += _check_party(party, f"стороны {number}")
-    if isinstance(document, UpdSchema | InvoiceSchema):
-        warnings += _check_party(document.seller, "продавца") + _check_party(document.buyer, "покупателя")
-        if isinstance(document, InvoiceSchema) and not validate_bik(document.bank.bik):
-            warnings.append(f"БИК банка {document.bank.bik} имеет неверный формат")
-        warnings += validate_invoice_math(document)
-    return warnings
+def _validate(document: UpdSchema | InvoiceSchema) -> list[str]:
+    """Пост-валидация УПД и счёта: реквизиты сторон, БИК и сходимость сумм."""
+    warnings = _check_party(document.seller, "продавца") + _check_party(document.buyer, "покупателя")
+    if isinstance(document, InvoiceSchema) and not validate_bik(document.bank.bik):
+        warnings.append(f"БИК банка {document.bank.bik} имеет неверный формат")
+    return warnings + validate_invoice_math(document)
 
 
 def _check_party(party: Counterparty, whose: str) -> list[str]:
@@ -170,29 +160,3 @@ def _schema_warnings(error: ValidationError) -> list[str]:
         )
         warnings.append(f"Поле {field}: {reason}")
     return warnings
-
-
-# --- Обход JSON ---------------------------------------------------------------------------
-
-
-def _strings(value: Any) -> Iterator[str]:
-    """Все непустые строковые значения JSON (ключи словарей не считаются)."""
-    if isinstance(value, str) and value:
-        yield value
-    elif isinstance(value, dict):
-        for item in value.values():
-            yield from _strings(item)
-    elif isinstance(value, list):
-        for item in value:
-            yield from _strings(item)
-
-
-def _replace_strings(value: Any, replacements: dict[str, str]) -> Any:
-    """Копия JSON, в которой строковые значения заменены по словарю replacements."""
-    if isinstance(value, str):
-        return replacements.get(value, value)
-    if isinstance(value, dict):
-        return {key: _replace_strings(item, replacements) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_replace_strings(item, replacements) for item in value]
-    return value

@@ -1,20 +1,29 @@
-"""Общая часть пайплайнов: набор внешних движков и единые шаги работы с ними."""
+"""Общая часть пайплайнов: набор ML-движков и единые шаги работы с ними."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 from redis.asyncio import Redis
 
-from app.clients.dlp import DlpClient
 from app.clients.docling import DoclingClient
 from app.clients.mineru import MineruClient
 from app.clients.paddle import PaddleClient
-from app.clients.vlm_gateway import VlmGatewayClient
+from app.clients.vlm import VlmClient
 from app.config import Settings
 from app.core.aio import run_cpu
+from app.core.classifier import RouteType, classify_file, decode_text
 from app.core.gpu_manager import GPUResourceManager
-from app.core.image_ops import resize_max_pixels
+
+
+@dataclass(frozen=True)
+class OcrResult:
+    """Итог распознавания документа."""
+
+    route: RouteType
+    markdown: str
+    engine: str  # сработавший движок: docling, mineru, paddle или none (текстовый файл отдан как есть)
+    figures: dict[str, bytes] = field(default_factory=dict)  # картинки, вырезанные MinerU: имя -> байты
 
 
 @dataclass(frozen=True)
@@ -26,8 +35,7 @@ class Engines:
     docling: DoclingClient
     mineru: MineruClient
     paddle: PaddleClient
-    vlm: VlmGatewayClient
-    dlp: DlpClient
+    vlm: VlmClient
 
     @classmethod
     def connect(cls, settings: Settings, redis: Redis, http: httpx.AsyncClient) -> "Engines":
@@ -40,24 +48,33 @@ class Engines:
             docling=DoclingClient(http, settings.docling_url),
             mineru=mineru,
             paddle=paddle,
-            vlm=VlmGatewayClient(http, settings.vlm_gateway_url, settings.vlm_model),
-            dlp=DlpClient(http, settings.dlp_url),
+            vlm=VlmClient(http, settings.ollama_url, settings.vlm_model, settings.vlm_num_ctx),
         )
 
-    async def paddle_ocr(self, file_bytes: bytes, filename: str) -> str:
-        """Скан с таблицами -> Markdown. PaddleOCR-VL работает на GPU 0, поэтому сначала занимаем его."""
-        async with self.gpu.acquire_gpu0("paddle"):
-            return await self.paddle.extract(file_bytes, filename)
+    async def ocr(self, file_bytes: bytes, filename: str, use_paddle: bool = False) -> OcrResult:
+        """Общий шаг пайплайнов: классифицирует файл и превращает его в Markdown подходящим движком.
+
+        Скан распознаёт MinerU, а с use_paddle — PaddleOCR-VL (печати и сложные таблицы).
+        GPU 0 занят только на время распознавания.
+        """
+        route = await run_cpu(classify_file, file_bytes, filename)
+        if route is RouteType.TEXT:
+            return OcrResult(route, decode_text(file_bytes) or "", "none")
+        if route in (RouteType.DIGITAL_OFFICE, RouteType.DIGITAL_PDF):
+            return OcrResult(route, await self.docling.convert(file_bytes, filename), "docling")  # CPU
+        if use_paddle:
+            async with self.gpu.acquire_gpu0("paddle"):
+                return OcrResult(route, await self.paddle.extract(file_bytes, filename), "paddle")
+        async with self.gpu.acquire_gpu0("mineru"):
+            reply = await self.mineru.extract(file_bytes, filename)
+        return OcrResult(route, reply.markdown, "mineru", reply.figures)
 
     async def ask_vlm(
         self, prompt: str, image: bytes | None = None, schema: dict[str, Any] | None = None
     ) -> str:
-        """Единственный путь к Qwen3-VL: DLP pre-check промпта -> очередь к GPU 1 -> Gateway.
+        """Единственный путь к Qwen3-VL: запросы идут через очередь к GPU 1, строго по одному.
 
-        Картинка уменьшается до max_pixels: более крупная не поместится в VRAM.
+        Картинка должна быть подготовлена smart_resize: более крупная не поместится в VRAM.
         """
-        prompt = (await self.dlp.inspect(prompt)).text
-        if image:
-            image = await run_cpu(resize_max_pixels, image, self.settings.max_pixels)
         async with self.gpu.acquire_gpu1():
             return await self.vlm.chat(prompt, image, schema)

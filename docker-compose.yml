@@ -1,5 +1,5 @@
-# Локальный стенд: оркестратор + Redis + заглушки ML-движков.
-# В проде укажите в .env адреса боевых контейнеров, а сервис mock-engines уберите.
+# Тестовый стенд: оркестратор + Redis + заглушка ML-движков.
+# Для боевого сервера с настоящими движками есть docker-compose.prod.yml.
 
 services:
   redis:
@@ -24,21 +24,14 @@ services:
 
   doc-orchestrator:
     build: .
+    image: doc-orchestrator
     restart: unless-stopped
     ports:
       - "8000:8000"
-    # Файл .env необязателен: без него сервис работает с заглушками
+    # Файл .env необязателен: по умолчанию сервис настроен на redis и mock-engines этого стенда
     env_file:
       - path: .env
         required: false
-    environment:
-      # Адреса внутри сети compose; переопределяются одноимёнными переменными из .env
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
-      DOCLING_URL: ${DOCLING_URL:-http://mock-engines:8001/docling}
-      MINERU_URL: ${MINERU_URL:-http://mock-engines:8001/mineru}
-      PADDLE_URL: ${PADDLE_URL:-http://mock-engines:8001/paddle}
-      VLM_GATEWAY_URL: ${VLM_GATEWAY_URL:-http://mock-engines:8001/gateway}
-      DLP_URL: ${DLP_URL:-http://mock-engines:8001/dlp}
     depends_on:
       redis:
         condition: service_healthy

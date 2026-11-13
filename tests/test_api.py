@@ -1,4 +1,4 @@
-"""HTTP-контракт сервиса: заголовки и токен Open WebUI, коды ошибок, ответы модели не по схеме, async_mode."""
+"""HTTP-контракт сервиса: заголовки и API-ключ, коды ошибок, ответы модели не по схеме, async_mode."""
 
 import asyncio
 import json
@@ -10,11 +10,11 @@ from urllib.parse import quote
 
 import httpx
 import pytest
-from conftest import MOCK_URL, engines_stub
+from conftest import engines_stub
 from fakeredis import FakeAsyncRedis, FakeServer
 
 from app.config import Settings
-from mocks.main import INVOICE, UPD, MockState
+from mocks.main import DOCUMENT, MockState
 
 ROOT = Path(__file__).parent.parent  # корень репозитория
 PDF = {"X-Filename": "scan.pdf"}
@@ -25,8 +25,8 @@ async def extract(client: httpx.AsyncClient, filename: str, data: bytes, **form:
 
 
 async def wait_for_task(client: httpx.AsyncClient, task_id: str) -> dict:
-    """Опрашивает задачу, пока она не завершится (до 5 секунд)."""
-    for _ in range(250):
+    """Опрашивает задачу, пока она не завершится."""
+    for _ in range(500):
         task = (await client.get(f"/api/tasks/{task_id}")).json()
         if task["status"] in ("completed", "failed"):
             return task
@@ -34,17 +34,16 @@ async def wait_for_task(client: httpx.AsyncClient, task_id: str) -> dict:
     raise AssertionError(f"Задача не завершилась: {task}")
 
 
-# --- PUT /process: заголовки и токен --------------------------------------------------------
+# --- PUT /process: заголовки и API-ключ ------------------------------------------------------
 
 
-async def test_filename_is_percent_decoded(client, scan_pdf: bytes):
+async def test_filename_is_percent_decoded(client, digital_pdf: bytes):
     # Open WebUI кодирует имя файла: quote("Счёт на оплату 57.pdf")
-    response = await client.put(
-        "/process", content=scan_pdf, headers={"X-Filename": quote("Счёт на оплату 57.pdf")}
-    )
+    headers = {"X-Filename": quote("Счёт на оплату 57.pdf")}
+    response = await client.put("/process", content=digital_pdf, headers=headers)
 
     assert response.json()["metadata"]["filename"] == "Счёт на оплату 57.pdf"
-    assert response.json()["metadata"]["engine_used"] == "paddle"  # «счёт» — документ с таблицей
+    assert "Счёт на оплату 57.pdf" in response.json()["page_content"]  # с этим именем файл ушёл в движок
 
 
 @pytest.mark.parametrize("sent_name", ["../../etc/report.pdf", "C:\\Документы\\report.pdf"])
@@ -56,14 +55,14 @@ async def test_filename_path_is_dropped(client, digital_pdf: bytes, sent_name: s
 
 
 async def test_extension_is_taken_from_content_type(client, digital_pdf: bytes):
-    headers = {"X-Filename": "document", "Content-Type": "application/pdf"}
+    headers = {"X-Filename": "document", "Content-Type": "application/pdf; charset=binary"}
     response = await client.put("/process", content=digital_pdf, headers=headers)
 
     assert response.status_code == 200
     assert response.json()["metadata"] == {
         "filename": "document.pdf",
+        "route": "DIGITAL_PDF",
         "engine_used": "docling",
-        "dlp_masked": False,
     }
 
 
@@ -72,7 +71,7 @@ async def test_missing_filename_header_is_rejected(client, scan_pdf: bytes):
     assert response.status_code == 422
 
 
-async def test_token_is_not_required_by_default(client, digital_pdf: bytes):
+async def test_api_key_is_not_required_by_default(client, digital_pdf: bytes):
     headers = {"X-Filename": "report.pdf", "Authorization": "Bearer anything"}
     assert (await client.put("/process", content=digital_pdf, headers=headers)).status_code == 200
 
@@ -81,27 +80,20 @@ async def test_token_is_not_required_by_default(client, digital_pdf: bytes):
     ("authorization", "expected_status"),
     [(None, 401), ("Bearer wrong", 401), ("s3cret", 401), ("Bearer s3cret", 200)],
 )
-async def test_token_is_checked_when_configured(
+async def test_api_key_is_checked_when_configured(
     start_app, digital_pdf: bytes, authorization, expected_status
 ):
     headers = {"X-Filename": "report.pdf"} | ({"Authorization": authorization} if authorization else {})
 
-    async with start_app(openwebui_api_token="s3cret") as client:
+    async with start_app(api_key="s3cret") as client:
         response = await client.put("/process", content=digital_pdf, headers=headers)
         health = await client.get("/health")
 
     assert response.status_code == expected_status
-    assert health.status_code == 200  # проверка живости токена не требует
+    assert health.status_code == 200  # проверка живости ключа не требует
 
 
 # --- Ошибки ---------------------------------------------------------------------------------
-
-
-async def test_unsupported_format_is_415(client):
-    response = await client.put("/process", content=b"plain text", headers={"X-Filename": "notes.txt"})
-
-    assert response.status_code == 415
-    assert response.json() == {"detail": "Формат файла «notes.txt» не поддерживается"}
 
 
 async def test_broken_pdf_is_422(client, mock: MockState):
@@ -124,40 +116,43 @@ async def test_too_large_file_is_413(start_app):
         too_large = await client.put(
             "/process", content=b"x" * (megabyte + 1), headers={"X-Filename": "big.docx"}
         )
-        structured = await extract(client, "big.docx", b"x" * (megabyte + 1), doc_type="contract")
+        structured = await extract(client, "big.docx", b"x" * (megabyte + 1), doc_type="upd")
 
     assert fits.status_code == 200
     assert (too_large.status_code, too_large.json()) == (413, {"detail": "Файл больше 1 МБ"})
     assert structured.status_code == 413
 
 
-@pytest.mark.parametrize("engine", ["docling", "dlp"])
-async def test_engine_failure_is_502(start_app, digital_pdf: bytes, engine: str):
-    async with start_app(http=engines_stub(failing=engine)) as client:
+async def test_engine_failure_is_502(start_app, digital_pdf: bytes):
+    async with start_app(http=engines_stub(failing="docling")) as client:
         response = await client.put("/process", content=digital_pdf, headers={"X-Filename": "report.pdf"})
 
     assert response.status_code == 502
-    assert "вернул HTTP 500: engine crashed" in response.json()["detail"]
+    assert response.json() == {"detail": "Docling вернул HTTP 500: engine crashed"}
 
 
-async def test_dlp_failure_never_leaks_unchecked_text(start_app, scan_pdf: bytes):
-    # DLP недоступен — текст наружу не отдаётся (ни из /process, ни из извлечения JSON)
-    async with start_app(dlp_url=f"{MOCK_URL}/no-dlp") as client:
-        markdown = await client.put("/process", content=scan_pdf, headers={"X-Filename": "table.pdf"})
-        structured = await extract(client, "shaft.pdf", scan_pdf, doc_type="drawing")
+async def test_service_recovers_after_engine_restart(client, scan_pdf: bytes, mock: MockState):
+    assert (await client.put("/process", content=scan_pdf, headers=PDF)).status_code == 200
+    mock.loaded.clear()  # движок перезапустился: модель из VRAM пропала
 
-    assert markdown.status_code == structured.status_code == 502
-    assert "DLP" in markdown.json()["detail"]
+    failed = await client.put("/process", content=scan_pdf, headers=PDF)
+    recovered = await client.put("/process", content=scan_pdf, headers=PDF)
+
+    assert (failed.status_code, failed.json()["detail"]) == (
+        502,
+        'MinerU вернул HTTP 500: {"detail":"MinerU not loaded"}',
+    )
+    assert recovered.status_code == 200  # следующая задача загрузила модель заново
 
 
 async def test_busy_gpu_is_503(start_app, scan_pdf: bytes, redis: FakeAsyncRedis):
     await redis.set("lock:gpu0", "занято другой задачей")
 
-    async with start_app(gpu_wait_timeout_s=0.2) as client:
+    async with start_app(gpu_lock_wait_sec=0.2) as client:
         response = await client.put("/process", content=scan_pdf, headers=PDF)
 
     assert response.status_code == 503
-    assert response.json()["detail"].startswith("Видеокарта занята")
+    assert response.json() == {"detail": "Видеокарта занята: очередь (lock:gpu0) не подошла за 0.2 с"}
 
 
 async def test_redis_failure_is_503(client, scan_pdf: bytes, redis_server: FakeServer):
@@ -174,8 +169,9 @@ async def test_redis_failure_is_503(client, scan_pdf: bytes, redis_server: FakeS
 # --- POST /api/extract-structured: проверка запроса -------------------------------------------
 
 
-async def test_unknown_doc_type_is_422(client, scan_pdf: bytes):
-    assert (await extract(client, "act.pdf", scan_pdf, doc_type="act")).status_code == 422
+@pytest.mark.parametrize("doc_type", ["act", "contract", ""])
+async def test_unknown_doc_type_is_422(client, scan_pdf: bytes, doc_type: str):
+    assert (await extract(client, "act.pdf", scan_pdf, doc_type=doc_type)).status_code == 422
 
 
 async def test_missing_form_fields_are_422(client, scan_pdf: bytes):
@@ -183,20 +179,21 @@ async def test_missing_form_fields_are_422(client, scan_pdf: bytes):
     assert (await extract(client, "upd.pdf", scan_pdf)).status_code == 422
 
 
-async def test_unsupported_structured_file_is_415(client):
-    assert (await extract(client, "upd.txt", b"text", doc_type="upd")).status_code == 415
-
-
-async def test_drawing_must_be_pdf_or_image(client):
-    office = await extract(client, "shaft.docx", b"PK\x03\x04", doc_type="drawing")
-    garbage = await extract(client, "shaft.dwg", b"AC1027 not an image", doc_type="drawing")
-
-    assert (office.status_code, office.json()["detail"]) == (
+async def test_binary_file_of_unknown_format_is_415(client):
+    response = await extract(client, "upd.zip", b"PK\x03\x04\x00\x00", doc_type="upd")
+    assert (response.status_code, response.json()) == (
         415,
-        "Чертёж принимается только как PDF или изображение",
+        {"detail": "Формат файла «upd.zip» не поддерживается"},
     )
-    assert garbage.status_code == 422
-    assert garbage.json()["detail"].startswith("Не удалось прочитать изображение")
+
+
+@pytest.mark.parametrize("filename", ["shaft.dwg", "shaft.docx", "shaft.png"])
+async def test_drawing_must_be_pdf_or_image(client, mock: MockState, filename: str):
+    response = await extract(client, filename, b"AC1027 not an image", doc_type="drawing")
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Файл не является ни PDF, ни изображением"}
+    assert mock.prompts == []
 
 
 # --- Ответ модели не по схеме: это предупреждения, а не сбой -------------------------------
@@ -209,18 +206,20 @@ async def test_answer_with_missing_fields(start_app, digital_pdf: bytes):
     assert response.status_code == 200
     body = response.json()
     assert body["data"] == {"number": "128", "date": "2025-03-14"}  # данные как есть
-    assert body["validation"]["is_valid"] is False
-    assert body["validation"]["warnings"] == [
-        "Поле seller: обязательное поле не заполнено",
-        "Поле buyer: обязательное поле не заполнено",
-        "Поле items: обязательное поле не заполнено",
-        "Поле document_total: обязательное поле не заполнено",
-    ]
+    assert body["validation"] == {
+        "is_valid": False,
+        "warnings": [
+            "Поле seller: обязательное поле не заполнено",
+            "Поле buyer: обязательное поле не заполнено",
+            "Поле items: обязательное поле не заполнено",
+            "Поле total_with_vat: обязательное поле не заполнено",
+        ],
+    }
 
 
 async def test_answer_with_wrong_value_type(start_app, digital_pdf: bytes):
-    items = [{**UPD["items"][0], "qty": "десять"}]
-    async with start_app(http=engines_stub(json.dumps({**UPD, "items": items}))) as client:
+    items = [{**DOCUMENT["items"][0], "qty": "десять"}]
+    async with start_app(http=engines_stub(json.dumps({**DOCUMENT, "items": items}))) as client:
         body = (await extract(client, "upd.pdf", digital_pdf, doc_type="upd")).json()
 
     assert body["validation"]["is_valid"] is False
@@ -229,25 +228,32 @@ async def test_answer_with_wrong_value_type(start_app, digital_pdf: bytes):
     assert body["data"]["items"][0]["qty"] == "десять"
 
 
-@pytest.mark.parametrize("answer", ["Извините, документ не читается", "[1, 2, 3]", '{"number": "128"'])
+@pytest.mark.parametrize(
+    "answer", ["Извините, документ не читается", "[1, 2, 3]", '{"number": "128"', "null"]
+)
 async def test_answer_that_is_not_a_json_object(start_app, digital_pdf: bytes, answer: str):
     async with start_app(http=engines_stub(answer)) as client:
         response = await extract(client, "upd.pdf", digital_pdf, doc_type="upd")
 
     assert response.status_code == 200
-    body = response.json()
-    assert body["data"] == {}
-    assert body["validation"]["is_valid"] is False
-    assert body["validation"]["warnings"]
+    assert response.json() == {
+        "status": "completed",
+        "doc_type": "upd",
+        "data": {},
+        "validation": {
+            "is_valid": False,
+            "warnings": ["Модель вернула не JSON-объект: данные извлечь не удалось"],
+        },
+    }
 
 
 async def test_bad_kpp_bik_and_row_math_are_reported(start_app, digital_pdf: bytes):
     broken = {
-        **INVOICE,
-        "seller": {**INVOICE["seller"], "kpp": "77010100"},  # 8 символов вместо 9
-        "buyer": {**INVOICE["buyer"], "inn": "502415678"},  # 9 цифр
-        "bank": {**INVOICE["bank"], "bik": "144525999"},  # начинается не с 04
-        "items": [{**INVOICE["items"][0], "amount_without_vat": 2600.0}, *INVOICE["items"][1:]],
+        **DOCUMENT,
+        "seller": {**DOCUMENT["seller"], "kpp": "77070100"},  # 8 символов вместо 9
+        "buyer": {**DOCUMENT["buyer"], "inn": "502415678"},  # 9 цифр
+        "bank": {**DOCUMENT["bank"], "bik": "144525225"},  # начинается не с 04
+        "items": [{**DOCUMENT["items"][0], "amount_without_vat": 2600.0}, *DOCUMENT["items"][1:]],
     }
     async with start_app(http=engines_stub(json.dumps(broken))) as client:
         body = (await extract(client, "invoice.pdf", digital_pdf, doc_type="invoice")).json()
@@ -255,57 +261,107 @@ async def test_bad_kpp_bik_and_row_math_are_reported(start_app, digital_pdf: byt
     assert body["validation"] == {
         "is_valid": False,
         "warnings": [
-            "КПП продавца 77010100 имеет неверный формат",
+            "КПП продавца 77070100 имеет неверный формат",
             "ИНН покупателя 502415678 не прошёл контрольную сумму",
-            "БИК банка 144525999 имеет неверный формат",
+            "БИК банка 144525225 имеет неверный формат",
             "Строка 1: кол-во × цена (2500.00) != сумма без НДС (2600.00)",
             "Строка 1: сумма без НДС + НДС (3100.00) != сумма по строке (3000.00)",
         ],
     }
 
 
-async def test_contract_parties_are_validated(start_app, digital_pdf: bytes):
-    contract = {
-        "number": "7",
-        "date": "2025-02-01",
-        "subject": "Оказание услуг",
-        "parties": [
-            {"name": "ИП Иванов И. И.", "inn": "771234567859", "role": "Исполнитель"},  # ИП: 12 цифр, КПП нет
-            {"name": "ООО «Вектор»", "inn": "5024156783", "kpp": "502401001"},
-        ],
-    }
-    async with start_app(http=engines_stub(json.dumps(contract))) as client:
-        body = (await extract(client, "contract.pdf", digital_pdf, doc_type="contract")).json()
+async def test_individual_entrepreneur_has_no_kpp(start_app, digital_pdf: bytes):
+    seller = {"name": "ИП Иванов И. И.", "inn": "771234567859"}  # ИП: ИНН из 12 цифр, КПП нет
+    async with start_app(http=engines_stub(json.dumps({**DOCUMENT, "seller": seller}))) as client:
+        body = (await extract(client, "upd.pdf", digital_pdf, doc_type="upd")).json()
 
-    assert body["validation"] == {
-        "is_valid": False,
-        "warnings": ["ИНН стороны 2 5024156783 не прошёл контрольную сумму"],
-    }
-    assert body["data"]["parties"][0] == {
+    assert body["validation"] == {"is_valid": True, "warnings": []}
+    assert body["data"]["seller"] == {
         "name": "ИП Иванов И. И.",
         "inn": "771234567859",
         "kpp": None,
         "address": None,
-        "role": "Исполнитель",
+    }
+
+
+async def test_drawing_answers_that_do_not_match_schema(start_app, drawing_a1: bytes):
+    answers = {
+        "DrawingStampCore": json.dumps({"title": "Вал приводной"}),  # нет обязательного обозначения
+        "TechRequirementsList": json.dumps({"requirements": "не список"}),
+    }
+    async with start_app(http=engines_stub(vlm=answers)) as client:
+        response = await extract(client, "shaft.png", drawing_a1, doc_type="drawing")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["data"] == {"title": "Вал приводной", "requirements": "не список"}  # как есть
+    assert body["validation"]["is_valid"] is False
+    stamp_warning, requirements_warning = body["validation"]["warnings"]
+    assert stamp_warning == "Поле designation: обязательное поле не заполнено"
+    assert requirements_warning.startswith("Поле requirements: некорректное значение")
+
+
+async def test_drawing_without_tech_requirements_answer(start_app, drawing_a1: bytes):
+    answers = {
+        "DrawingStampCore": json.dumps({"designation": "АБВГ.1", "title": "Вал"}),
+        "TechRequirementsList": "нет",
+    }
+    async with start_app(http=engines_stub(vlm=answers)) as client:
+        body = (await extract(client, "shaft.png", drawing_a1, doc_type="drawing")).json()
+
+    assert body["data"] == {"designation": "АБВГ.1", "title": "Вал"}  # что успели прочитать
+    assert body["validation"] == {
+        "is_valid": False,
+        "warnings": ["Модель вернула не JSON-объект: данные извлечь не удалось"],
     }
 
 
 # --- Асинхронный режим ------------------------------------------------------------------------
 
 
-async def test_async_mode_returns_task_id_then_result(client, scan_pdf: bytes):
+def blocked_vlm() -> tuple[httpx.AsyncClient, asyncio.Event, list[str]]:
+    """Движки, у которых Qwen3-VL молчит, пока тест не разрешит: клиент, «шлагбаум» и журнал запросов."""
+    release, started = asyncio.Event(), []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/api/chat"):
+            started.append(json.loads(request.content)["messages"][0]["content"])
+            await release.wait()
+            return httpx.Response(200, json={"message": {"content": json.dumps(DOCUMENT)}})
+        return httpx.Response(200, json={"markdown": "Текст документа"})
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler)), release, started
+
+
+async def statuses(client: httpx.AsyncClient, task_ids: list[str]) -> list[str]:
+    return [(await client.get(f"/api/tasks/{task_id}")).json()["status"] for task_id in task_ids]
+
+
+async def test_async_mode_returns_task_id_then_result(client, scan_pdf: bytes, redis: FakeAsyncRedis):
     response = await extract(client, "upd.pdf", scan_pdf, doc_type="upd", async_mode="true")
 
     assert response.status_code == 202
     queued = response.json()
     assert set(queued) == {"task_id", "status"}
     assert queued["status"] == "queued"
+    assert 3590 < await redis.ttl(f"task:{queued['task_id']}") <= 3600  # состояние хранится час
 
     task = await wait_for_task(client, queued["task_id"])
     assert set(task) == {"task_id", "status", "doc_type", "data", "validation"}
     assert (task["task_id"], task["status"], task["doc_type"]) == (queued["task_id"], "completed", "upd")
     assert task["validation"] == {"is_valid": True, "warnings": []}
-    assert task["data"]["seller"]["inn"] == "7701234560"
+    assert task["data"]["seller"]["inn"] == "7707083893"
+    assert 3590 < await redis.ttl(f"task:{queued['task_id']}") <= 3600  # результат — тоже
+
+
+async def test_async_task_honors_has_seals(client, scan_pdf: bytes, mock: MockState):
+    queued = (
+        await extract(client, "invoice.pdf", scan_pdf, doc_type="invoice", has_seals="1", async_mode="1")
+    ).json()
+
+    await wait_for_task(client, queued["task_id"])
+
+    assert "paddle/extract" in mock.calls
 
 
 async def test_async_task_with_bad_data_completes_with_warnings(client, scan_pdf: bytes):
@@ -328,12 +384,79 @@ async def test_async_task_failure_is_reported(client):
     assert task["error"].startswith("Не удалось прочитать PDF")
 
 
+async def test_unexpected_error_in_async_task_does_not_leak_details(start_app, digital_pdf: bytes):
+    def crash(request: httpx.Request) -> httpx.Response:
+        raise RuntimeError("секретные подробности")
+
+    async with start_app(http=httpx.AsyncClient(transport=httpx.MockTransport(crash))) as client:
+        queued = (await extract(client, "upd.pdf", digital_pdf, doc_type="upd", async_mode="true")).json()
+        task = await wait_for_task(client, queued["task_id"])
+
+    assert (task["status"], task["error"]) == ("failed", "Внутренняя ошибка сервиса")
+
+
+async def wait_until_vlm_is_asked(started: list[str]) -> None:
+    """Ждёт (до 2 секунд), пока первая задача дойдёт до Qwen3-VL, и даёт остальным время стартовать."""
+    for _ in range(200):
+        if started:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.05)
+
+
+async def test_async_tasks_wait_for_a_free_slot(start_app, digital_pdf: bytes):
+    http, release, started = blocked_vlm()
+
+    async with start_app(http=http, task_concurrency=2) as client:
+        task_ids = [
+            (await extract(client, f"upd_{n}.pdf", digital_pdf, doc_type="upd", async_mode="true")).json()[
+                "task_id"
+            ]
+            for n in range(5)
+        ]
+        await wait_until_vlm_is_asked(started)
+
+        # Работают две задачи (вторая ждёт GPU 1), остальным свободного места пока нет
+        assert await statuses(client, task_ids) == ["processing", "processing", "queued", "queued", "queued"]
+        assert len(started) == 1
+
+        release.set()
+        results = [await wait_for_task(client, task_id) for task_id in task_ids]
+        assert [task["status"] for task in results] == ["completed"] * 5
+        assert client._transport.app.state.background_tasks == set()  # завершённые задачи не копятся в памяти
+
+
+async def test_async_tasks_are_marked_failed_when_service_stops(
+    start_app, digital_pdf: bytes, redis: FakeAsyncRedis
+):
+    http, _, started = blocked_vlm()
+
+    async with (
+        asyncio.timeout(10),
+        start_app(http=http, task_concurrency=1) as client,
+    ):  # остановка не зависает
+        task_ids = [
+            (await extract(client, "upd.pdf", digital_pdf, doc_type="upd", async_mode="true")).json()[
+                "task_id"
+            ]
+            for _ in range(2)
+        ]
+        await wait_until_vlm_is_asked(started)
+        assert await statuses(client, task_ids) == ["processing", "queued"]
+    # Сервис остановлен: и работавшая, и ждавшая задачи завершены с понятной причиной
+
+    for task_id in task_ids:
+        task = json.loads(await redis.get(f"task:{task_id}"))
+        assert task["status"] == "failed"
+        assert task["error"] == "Сервис был остановлен: отправьте документ повторно"
+
+
 async def test_async_tasks_share_gpu_queue_with_sync_requests(
-    client, scan_pdf: bytes, drawing_png: bytes, mock
+    client, scan_pdf: bytes, drawing_a1: bytes, mock
 ):
     files = [
         ("upd.pdf", scan_pdf, "upd"),
-        ("shaft.png", drawing_png, "drawing"),
+        ("shaft.png", drawing_a1, "drawing"),
         ("invoice.pdf", scan_pdf, "invoice"),
     ]
     queued = [
@@ -347,18 +470,15 @@ async def test_async_tasks_share_gpu_queue_with_sync_requests(
     assert [response.status_code for response in sync] == [200] * 3
     assert [task["status"] for task in tasks] == ["completed"] * 3
     assert [task["doc_type"] for task in tasks] == ["upd", "drawing", "invoice"]
-    assert (mock.oom_errors, mock.gateway_rejects, mock.gpu0_peak) == (0, 0, 1)
+    assert (mock.oom_errors, mock.gpu1_rejects, mock.gpu0_peak) == (0, 0, 1)
 
 
-async def test_unknown_task_is_404(client):
-    response = await client.get("/api/tasks/00000000-0000-4000-8000-000000000000")
+@pytest.mark.parametrize("task_id", ["00000000-0000-4000-8000-000000000000", "no-such-task"])
+async def test_unknown_task_is_404(client, task_id: str):
+    response = await client.get(f"/api/tasks/{task_id}")
 
     assert response.status_code == 404
     assert response.json() == {"detail": "Задача не найдена или срок её хранения истёк"}
-
-
-async def test_malformed_task_id_is_422(client):
-    assert (await client.get("/api/tasks/not-a-uuid")).status_code == 422
 
 
 # --- Настройки и служебное --------------------------------------------------------------------
@@ -372,13 +492,22 @@ def test_env_example_lists_every_setting():
     Settings(_env_file=ROOT / ".env.example")  # все значения образца проходят проверку типов
 
 
+def test_default_limits_match_the_spec():
+    defaults = Settings(_env_file=None)
+
+    assert (defaults.max_pixels, defaults.overview_dpi, defaults.drawing_dpi) == (1_280_000, 150, 300)
+    assert (defaults.task_ttl_sec, defaults.api_key) == (3600, "")
+    assert defaults.redis_url == "redis://redis:6379/0"  # адреса по умолчанию — контейнеры docker compose
+    assert defaults.docling_url == "http://mock-engines:8001/docling"
+
+
 def test_service_starts_with_settings_from_environment():
     # Так сервис запускает uvicorn: импорт app.main собирает приложение из переменных окружения
-    env = {**os.environ, "LOG_LEVEL": "debug", "PADDLE_URL": "http://paddle.prod"}
-    code = "from app.main import app; print(app.state.settings.paddle_url)"
+    env = {**os.environ, "LOG_LEVEL": "debug", "PADDLE_URL": "http://paddle.prod", "API_KEY": "s3cret"}
+    code = "from app.main import app; s = app.state.settings; print(s.paddle_url, s.api_key)"
     result = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True)
 
-    assert result.stdout.strip() == "http://paddle.prod", result.stderr
+    assert result.stdout.strip() == "http://paddle.prod s3cret", result.stderr
 
 
 async def test_openapi_describes_all_endpoints(client):
@@ -388,33 +517,43 @@ async def test_openapi_describes_all_endpoints(client):
     assert "put" in paths["/process"]
 
 
-async def test_engine_urls_come_from_settings(start_app, mock_app, scan_pdf: bytes, drawing_png: bytes):
+async def test_engine_urls_and_model_come_from_settings(
+    start_app, mock_app, scan_pdf: bytes, drawing_a1: bytes
+):
     # Каждому движку задаём свой хост и проверяем, что запросы уходят именно туда, куда велят настройки
     seen: set[str] = set()
+    models: set[tuple[str, int]] = set()
     mock_transport = httpx.ASGITransport(app=mock_app)
 
     class Recorder(httpx.AsyncBaseTransport):
         async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-            seen.add(f"{request.url.host}/{request.url.path.split('/')[1]}")
+            seen.add(f"{request.url.host}{request.url.path}")
+            if request.url.path == "/api/chat":
+                body = json.loads(request.content)
+                models.add((body["model"], body["options"]["num_ctx"]))
             return await mock_transport.handle_async_request(request)
 
     hosts = {
         "docling_url": "http://docling.prod/docling",
         "mineru_url": "http://mineru.prod/mineru",
         "paddle_url": "http://paddle.prod/paddle",
-        "vlm_gateway_url": "http://gateway.prod/gateway",
-        "dlp_url": "http://dlp.prod/dlp",
+        "ollama_url": "http://ollama.prod",
+        "vlm_model": "qwen3-vl:8b-instruct",
+        "vlm_num_ctx": 4096,
     }
     async with start_app(http=httpx.AsyncClient(transport=Recorder()), **hosts) as client:
-        await client.put("/process", content=scan_pdf, headers=PDF)  # mineru + qwen + dlp
-        await client.put("/process", content=scan_pdf, headers={"X-Filename": "table.pdf"})  # paddle
+        await client.put("/process", content=scan_pdf, headers=PDF)  # mineru + qwen
+        await client.put("/process", content=scan_pdf, headers={**PDF, "X-OCR-Engine": "paddle"})
         await client.put("/process", content=b"PK", headers={"X-Filename": "report.docx"})  # docling
-        await extract(client, "shaft.png", drawing_png, doc_type="drawing")
 
     assert seen == {
-        "docling.prod/docling",
-        "mineru.prod/mineru",
-        "paddle.prod/paddle",
-        "gateway.prod/gateway",
-        "dlp.prod/dlp",
+        "docling.prod/docling/convert",
+        "mineru.prod/mineru/load",
+        "mineru.prod/mineru/unload",
+        "mineru.prod/mineru/extract",
+        "paddle.prod/paddle/load",
+        "paddle.prod/paddle/unload",
+        "paddle.prod/paddle/extract",
+        "ollama.prod/api/chat",
     }
+    assert models == {("qwen3-vl:8b-instruct", 4096)}

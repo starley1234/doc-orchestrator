@@ -1,5 +1,6 @@
-"""Точка входа FastAPI: сборка приложения и lifespan (подключение к Redis и движкам)."""
+"""Точка входа FastAPI: сборка приложения и lifespan (Redis, HTTP-клиент, фоновый возврат GPU 0 к MinerU)."""
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -13,12 +14,18 @@ from redis.exceptions import RedisError
 from app.api import enterprise, openwebui
 from app.config import Settings, get_settings
 from app.core.errors import OrchestratorError
-from app.core.tasks import TaskQueue
 from app.pipelines.base import Engines
 from app.pipelines.markdown_pipe import MarkdownPipeline
 from app.pipelines.structured_pipe import StructuredPipeline
 
 log = logging.getLogger(__name__)
+
+
+async def _cancel(tasks: set[asyncio.Task[None]]) -> None:
+    """Прерывает фоновые задачи и дожидается их завершения."""
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def create_app(
@@ -36,21 +43,21 @@ def create_app(
             # Закрываем только те подключения, которые открыли сами
             redis_client = redis or await stack.enter_async_context(Redis.from_url(settings.redis_url))
             http_client = http or await stack.enter_async_context(
-                httpx.AsyncClient(timeout=settings.http_timeout_s)
+                httpx.AsyncClient(timeout=settings.http_timeout_sec)
             )
 
             engines = Engines.connect(settings, redis_client, http_client)
-            structured_pipeline = StructuredPipeline(engines)
-            tasks = TaskQueue(redis_client, structured_pipeline.run, settings)
             app.state.redis = redis_client
             app.state.markdown_pipeline = MarkdownPipeline(engines)
-            app.state.structured_pipeline = structured_pipeline
-            app.state.tasks = tasks
+            app.state.structured_pipeline = StructuredPipeline(engines)
 
             engines.gpu.start()  # фоновый возврат GPU 0 к mineru после простоя paddle
             stack.push_async_callback(engines.gpu.stop)
-            await tasks.start()  # воркеры асинхронных задач
-            stack.push_async_callback(tasks.stop)
+
+            # Фоновые задачи async_mode: одновременно работают не больше task_concurrency, остальные ждут
+            app.state.background_tasks = set()
+            app.state.task_slots = asyncio.Semaphore(settings.task_concurrency)
+            stack.push_async_callback(_cancel, app.state.background_tasks)
             yield
 
     app = FastAPI(title="doc-orchestrator", lifespan=lifespan)

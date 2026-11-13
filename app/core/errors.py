@@ -19,14 +19,14 @@ class FileTooLargeError(OrchestratorError):
     status_code = 413
 
 
-class InvalidFileError(OrchestratorError):
-    """Файл повреждён, защищён паролем или не читается."""
+class InvalidFileError(OrchestratorError, ValueError):
+    """Файл пуст, повреждён, защищён паролем или не читается."""
 
     status_code = 422
 
 
 class EngineError(OrchestratorError):
-    """Внешний движок (OCR, VLM, DLP) недоступен или вернул ошибку."""
+    """ML-движок (OCR, VLM) недоступен или вернул ошибку."""
 
     status_code = 502
 

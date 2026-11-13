@@ -8,7 +8,7 @@ from app.schemas.invoice import InvoiceSchema
 from app.schemas.upd import UpdSchema
 from app.validators.checksums import validate_bik, validate_inn, validate_kpp
 from app.validators.math_checks import validate_invoice_math
-from mocks.main import INVOICE
+from mocks.main import DOCUMENT
 
 # --- ИНН ----------------------------------------------------------------------------------
 
@@ -37,22 +37,23 @@ def test_valid_inn_of_individual(inn: str):
         "0000000000",  # контрольная сумма сходится, но кода региона 00 нет
         "７７０１２３４５６０",  # полноширинные цифры Юникода
         "",
+        None,
     ],
 )
-def test_invalid_inn(inn: str):
+def test_invalid_inn(inn: str | None):
     assert not validate_inn(inn)
 
 
 # --- КПП и БИК ----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("kpp", ["770101001", "7701AB001", "502401001"])
+@pytest.mark.parametrize("kpp", ["770701001", "7701AB001", "502401001"])
 def test_valid_kpp(kpp: str):
     assert validate_kpp(kpp)
 
 
-@pytest.mark.parametrize("kpp", ["77010100", "7701010010", "7701ab001", "АБ0101001", "770101 01", ""])
-def test_invalid_kpp(kpp: str):
+@pytest.mark.parametrize("kpp", ["77010100", "7701010010", "7701ab001", "АБ0101001", "770101 01", "", None])
+def test_invalid_kpp(kpp: str | None):
     assert not validate_kpp(kpp)
 
 
@@ -61,8 +62,8 @@ def test_valid_bik(bik: str):
     assert validate_bik(bik)
 
 
-@pytest.mark.parametrize("bik", ["144525225", "04452522", "0445252250", "04452522A", ""])
-def test_invalid_bik(bik: str):
+@pytest.mark.parametrize("bik", ["144525225", "04452522", "0445252250", "04452522A", "", None])
+def test_invalid_bik(bik: str | None):
     assert not validate_bik(bik)
 
 
@@ -80,7 +81,7 @@ def upd(rows: list[tuple[float, float, float, float, float]], total: float) -> U
         "items": [
             {"name": f"Товар {n}", **dict(zip(keys, row, strict=True))} for n, row in enumerate(rows, 1)
         ],
-        "document_total": total,
+        "total_with_vat": total,
     }
     return UpdSchema.model_validate_json(json.dumps(document))
 
@@ -93,7 +94,7 @@ def test_math_ok():
 
 
 def test_math_ok_for_invoice():
-    assert validate_invoice_math(InvoiceSchema.model_validate(INVOICE)) == []
+    assert validate_invoice_math(InvoiceSchema.model_validate(DOCUMENT)) == []
 
 
 def test_math_tolerates_kopeck_rounding():
@@ -123,7 +124,7 @@ def test_math_detects_vat_mismatch():
 
 def test_math_detects_total_mismatch():
     document = upd([(4, 200.00, 800.00, 200.00, 1000.00)], total=1200.00)
-    assert validate_invoice_math(document) == ["Сумма по строкам (1000.00) != Итого (1200.00)"]
+    assert validate_invoice_math(document) == ["Сумма по строкам (1000.00) != Итого по документу (1200.00)"]
 
 
 def test_math_reports_all_mismatches_at_once():

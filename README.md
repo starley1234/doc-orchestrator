@@ -1,24 +1,26 @@
 # doc-orchestrator
 
-Сервис оркестрации обработки документов (FastAPI + Redis). Принимает файл, выбирает OCR/VLM-движок,
-выстраивает очередь к видеокартам, проверяет результат в DLP и валидаторами и возвращает:
+Сервис оркестрации распознавания документов (FastAPI + Redis + asyncio) для сервера с двумя GPU по 8 ГБ.
+Принимает файл, выбирает OCR/VLM-движок, выстраивает очередь к видеокартам, проверяет реквизиты
+валидаторами и возвращает:
 
 * **Markdown** — для Open WebUI (`PUT /process`);
-* **строгий JSON с валидацией** — для 1С и Teamcenter (`POST /api/extract-structured`).
+* **строгий JSON с валидацией** — для 1С:ДО и Teamcenter (`POST /api/extract-structured`).
 
 | Что пришло | Куда идёт |
 |---|---|
-| DOCX, XLSX, PPTX, HTML, PDF с текстовым слоем | Docling (CPU) |
-| Скан: PDF без текста, JPG, PNG, TIFF | MinerU (GPU 0); картинки из скана описывает Qwen3-VL (GPU 1) |
-| Скан с таблицей или формой — в имени файла есть «упд», «счёт», «накладная», «таблица», `invoice`, `table`, `form`… | PaddleOCR-VL (GPU 0) |
-| УПД, счёт, договор (`doc_type`) | Docling или PaddleOCR-VL → Qwen3-VL (JSON по схеме) → валидаторы |
+| DOCX, XLSX, PPTX, HTML, MD, TXT, PDF с текстовым слоем | Docling (CPU) |
+| Скан: PDF без текста, JPG, PNG, TIFF, BMP, WebP | MinerU (GPU 0); схемы из скана Qwen3-VL (GPU 1) переводит в Mermaid |
+| Скан с печатями или сложными таблицами (`X-OCR-Engine: paddle`, `has_seals=true`, скан УПД) | PaddleOCR-VL (GPU 0) |
+| УПД, счёт (`doc_type=upd`, `invoice`) | OCR → Qwen3-VL (JSON по схеме) → проверка ИНН, КПП, БИК и сумм |
 | Чертёж (`doc_type=drawing`) | кропы штампа и техтребований → Qwen3-VL |
+| Прочие текстовые файлы (CSV, JSON, XML, код…) | отдаются как есть, без движков |
 
-Настоящих ML-движков в репозитории нет: их заменяет сервис `mock-engines`. Он отвечает по тем же
-HTTP-контрактам и имитирует ограничения железа: `500 Out Of Memory`, если на GPU 0 оказались две модели
-или в Qwen3-VL пришла слишком большая картинка, и `429` на параллельные запросы к GPU 1.
+Настоящих ML-движков в репозитории нет: на тестовом стенде их заменяет сервис `mock-engines`. Он
+имитирует ограничения железа: `500 Simulated OOM`, если на GPU 0 оказались две модели, и `429`
+на параллельные запросы к GPU 1.
 
-## Запуск
+## Запуск тестового стенда
 
 ```bash
 docker compose up --build -d       # redis, mock-engines (:8001), doc-orchestrator (:8000)
@@ -26,28 +28,32 @@ curl http://localhost:8000/health  # {"status":"ok"}
 ```
 
 Нужен Docker Compose 2.24 или новее. Описание API — <http://localhost:8000/docs>. Что загружено
-в «видеопамять» мока и нарушались ли лимиты GPU — `curl http://localhost:8001/state`.
+в «видеопамять» мока и нарушались ли лимиты GPU — `curl http://localhost:8001/mock/state`.
 
 ## Примеры запросов
+
+Для примеров подойдут любые свои файлы: мок-движки не смотрят на содержимое.
 
 ### Open WebUI: документ → Markdown
 
 ```bash
 curl -X PUT http://localhost:8000/process \
-  -H "X-Filename: scan.pdf" \
-  -H "Content-Type: application/pdf" \
-  -H "Authorization: Bearer my-token" \
-  --data-binary @tests/samples/scan.pdf
+  -H "X-Filename: scan.jpg" \
+  -H "Content-Type: image/jpeg" \
+  --data-binary @scan.jpg
 ```
 
 ```json
 {
-  "page_content": "# Отчёт (MinerU)\n\nРаспознанный текст скана.\n\n```mermaid\ngraph TD; A-->B;\n```\n\nТекст после схемы.",
-  "metadata": {"filename": "scan.pdf", "engine_used": "mineru+qwen3vl", "dlp_masked": false}
+  "page_content": "# Скан scan.jpg (MinerU)\n\nРаспознанный текст.\n\n```mermaid\ngraph TD;\n  A[Вход] --> B[Обработка];\n```\n\nТекст после схемы.",
+  "metadata": {"filename": "scan.jpg", "route": "SCAN_IMAGE", "engine_used": "mineru+qwen3-vl"}
 }
 ```
 
-Заголовок `Authorization` проверяется, только если задан `OPENWEBUI_API_TOKEN`.
+Необязательные заголовки:
+
+* `X-OCR-Engine: paddle` — распознать скан в PaddleOCR-VL (печати, сложные таблицы); по умолчанию `auto` — MinerU;
+* `Authorization: Bearer <ключ>` — обязателен, если задан `API_KEY`.
 
 Настройки на стороне Open WebUI (переменные окружения):
 
@@ -55,23 +61,19 @@ curl -X PUT http://localhost:8000/process \
 CONTENT_EXTRACTION_ENGINE=external
 EXTERNAL_DOCUMENT_LOADER_URL=http://doc-orchestrator:8000
 # Ключ обязателен: без него Open WebUI не включает внешний загрузчик.
-# Если задан OPENWEBUI_API_TOKEN, ключ должен с ним совпадать.
-EXTERNAL_DOCUMENT_LOADER_API_KEY=my-token
+# Если в оркестраторе задан API_KEY, значения должны совпадать.
+EXTERNAL_DOCUMENT_LOADER_API_KEY=my-key
 ```
 
-В этом режиме Open WebUI отправляет в загрузчик файлы любых типов. Форматы, которых нет в таблице выше
-(например, `.txt`, `.md`, `.csv`), сервис отклоняет с кодом 415.
-
-### 1С: документ → JSON с валидацией
+### 1С:ДО: УПД или счёт → JSON с валидацией
 
 ```bash
 curl -X POST http://localhost:8000/api/extract-structured \
-  -F "file=@tests/samples/scan.pdf" \
+  -F "file=@upd.pdf" \
   -F "doc_type=upd"
 ```
 
-`doc_type` — `upd`, `invoice`, `contract` или `drawing`; схемы поля `data` лежат в `app/schemas/`.
-Ответ (сокращён):
+Ответ (сокращён); схемы поля `data` лежат в `app/schemas/`:
 
 ```
 {
@@ -80,14 +82,14 @@ curl -X POST http://localhost:8000/api/extract-structured \
   "data": {
     "number": "128",
     "date": "2025-03-14",
-    "seller": {"name": "ООО «Ромашка»", "inn": "7701234560", "kpp": "770101001", "address": "…"},
+    "seller": {"name": "ООО «Ромашка»", "inn": "7707083893", "kpp": "770701001", "address": "…"},
     "buyer": {…},
     "items": [
       {"name": "Подшипник 6205-2RS", "unit": "шт", "qty": 10.0, "price": 250.0, "amount_without_vat": 2500.0,
        "vat_rate": "20%", "vat_amount": 500.0, "row_total": 3000.0},
       …
     ],
-    "document_total": 34923.0,
+    "total_with_vat": 34923.0,
     …
   },
   "validation": {"is_valid": true, "warnings": []}
@@ -95,11 +97,11 @@ curl -X POST http://localhost:8000/api/extract-structured \
 ```
 
 Ошибки в данных — не сбой: сервис отвечает `200 OK`, отдаёт `data` как есть, а причины пишет в `warnings`,
-чтобы документ ушёл на ручную проверку. Мок возвращает «битый» УПД для файла с именем `bad_inn.pdf`:
+чтобы документ ушёл оператору на ручную проверку. Мок возвращает «битый» УПД для файла с именем `bad_inn.pdf`:
 
 ```bash
 curl -X POST http://localhost:8000/api/extract-structured \
-  -F "file=@tests/samples/scan.pdf;filename=bad_inn.pdf" \
+  -F "file=@upd.pdf;filename=bad_inn.pdf" \
   -F "doc_type=upd"
 ```
 
@@ -108,46 +110,44 @@ curl -X POST http://localhost:8000/api/extract-structured \
   "is_valid": false,
   "warnings": [
     "ИНН продавца 7701234569 не прошёл контрольную сумму",
-    "Сумма по строкам (34923.00) != Итого (35923.00)"
+    "Сумма по строкам (1200.00) != Итого по документу (1500.00)"
   ]
 }
 ```
 
-Асинхронный режим: задача ставится в очередь, результат забирают отдельным запросом.
+Необязательные поля формы:
 
-```bash
-curl -X POST http://localhost:8000/api/extract-structured \
-  -F "file=@tests/samples/scan.pdf" \
-  -F "doc_type=invoice" \
-  -F "async_mode=true"
-# 202 Accepted: {"task_id": "5cbb32e1-…", "status": "queued"}
-
-curl http://localhost:8000/api/tasks/5cbb32e1-…
-# {"task_id": "5cbb32e1-…", "status": "completed", "doc_type": "invoice", "data": {…}, "validation": {…}}
-```
-
-Состояния задачи: `queued` → `processing` → `completed` или `failed` (причина — в поле `error`).
+* `has_seals=true` — на скане печати или сложные таблицы: его прочитает PaddleOCR-VL (скан УПД — всегда);
+* `async_mode=true` — обработка в фоне: ответ `202` с `task_id`, результат отдаёт `GET /api/tasks/{task_id}`.
 
 ### Teamcenter: чертёж → основная надпись и техтребования
 
 ```bash
 curl -X POST http://localhost:8000/api/extract-structured \
-  -F "file=@tests/samples/drawing.png" \
-  -F "doc_type=drawing"
+  -F "file=@drawing.pdf" \
+  -F "doc_type=drawing" \
+  -F "async_mode=true"
+# 202 Accepted: {"task_id": "a9131301-…", "status": "queued"}
+
+curl http://localhost:8000/api/tasks/a9131301-…
 ```
 
 ```
 {
+  "task_id": "a9131301-…",
   "status": "completed",
   "doc_type": "drawing",
   "data": {
-    "designation": "АБВГ.123456.001", "title": "Вал приводной", "material": "Сталь 45 ГОСТ 1050-2013",
-    "mass": "12.5", "scale": null, "organization": null,
-    "tech_requirements": ["1. 42...48 HRC.", …, "3. Острые кромки притупить."]
+    "designation": "АБВГ.711141.001", "title": "Вал приводной", "material": "Сталь 45 ГОСТ 1050-2013",
+    "mass": "12.5", "scale": "1:1", "organization": "АО КБ Маш",
+    "requirements": ["1. Неуказанные предельные отклонения размеров H14, h14, +/-IT14/2.", "2. Острые кромки притупить R0,5."]
   },
   "validation": {"is_valid": true, "warnings": []}
 }
 ```
+
+Состояния задачи: `queued` → `processing` → `completed` или `failed` (причина — в поле `error`).
+Состояние и результат хранятся час (`TASK_TTL_SEC`).
 
 ### Коды ошибок
 
@@ -155,52 +155,54 @@ curl -X POST http://localhost:8000/api/extract-structured \
 
 | Код | Когда |
 |---|---|
-| 401 | неверный токен в `PUT /process` |
+| 401 | неверный ключ в `PUT /process` |
 | 404 | задача не найдена или срок её хранения истёк |
 | 413 | файл больше `MAX_FILE_SIZE_MB` |
-| 415 | формат файла не поддерживается |
+| 415 | двоичный файл неизвестного формата |
 | 422 | файл пуст, повреждён или защищён паролем; неверные параметры запроса |
-| 502 | движок (OCR, VLM, DLP) недоступен или ответил ошибкой |
-| 503 | видеокарта занята дольше `GPU_WAIT_TIMEOUT_S`; недоступен Redis |
+| 502 | движок (OCR, VLM) недоступен или ответил ошибкой |
+| 503 | видеокарта занята дольше `GPU_LOCK_WAIT_SEC`; недоступен Redis |
 
-## Настройка и переход на боевые движки
+## Боевой сервер
 
 Все параметры задаются переменными окружения или файлом `.env`: образец — `.env.example`, значения
-по умолчанию — `app/config.py`. Адресов в коде нет, поэтому для перехода с заглушек на боевые движки
-достаточно поменять URL (сервис `mock-engines` и его `depends_on` тогда можно убрать из `docker-compose.yml`):
+по умолчанию — `app/config.py`. Адресов в коде нет: для перехода на настоящие движки достаточно
+указать их URL и запустить стенд без заглушки:
 
 ```bash
-# .env — базовые адреса; пути из таблицы ниже оркестратор добавляет сам
-DOCLING_URL=http://docling.internal:5001
-MINERU_URL=http://mineru.internal:8000
-PADDLE_URL=http://paddle.internal:8000
-VLM_GATEWAY_URL=http://gateway.internal:8080
-DLP_URL=http://dlp.internal:8000
+cp .env.example .env   # указать DOCLING_URL, MINERU_URL, PADDLE_URL, OLLAMA_URL и при необходимости API_KEY
+docker compose -f docker-compose.prod.yml up -d --build   # redis и doc-orchestrator (:8000)
 ```
 
-От движков оркестратор ждёт тот же HTTP-контракт, что у `mock-engines`. Если API боевого движка
-отличается, перед ним ставится тонкий адаптер.
+Движок, опубликованный на порту самого сервера, из контейнера доступен как `host.docker.internal`,
+например `OLLAMA_URL=http://host.docker.internal:11434`. Модель задаётся в `VLM_MODEL`
+(по умолчанию `qwen3-vl:4b-instruct-q8_0`; нужен instruct-вариант, не thinking).
+
+От движков оркестратор ждёт такие HTTP-контракты (те же, что у `mock-engines`):
 
 | Движок | Запрос | Ответ |
 |---|---|---|
 | Docling | `POST {DOCLING_URL}/convert`, multipart-поле `file` | `{"markdown": "…"}` |
-| MinerU | `POST {MINERU_URL}/extract`, поле `file`; `POST …/load`, `POST …/unload` | `{"markdown": "… ![fig_1](fig_1.png) …", "images": [{"name": "fig_1.png", "data": "<base64>"}]}` |
+| MinerU | `POST {MINERU_URL}/extract`, поле `file`; `POST …/load`, `POST …/unload` | `{"markdown": "… ![Схема](fig_1.png) …", "figures": {"fig_1.png": "<base64>"}}` |
 | PaddleOCR-VL | `POST {PADDLE_URL}/extract`, поле `file`; `POST …/load`, `POST …/unload` | `{"markdown": "…"}` |
-| Gateway (Qwen3-VL) | `POST {VLM_GATEWAY_URL}/v1/chat/completions` — чат в формате OpenAI; JSON Schema ответа — в поле `format` | `{"choices": [{"message": {"content": "…"}}]}` |
-| DLP | `POST {DLP_URL}/inspect`, JSON `{"text": "…"}` | `{"text": "…", "masked": true}` |
+| Ollama (Qwen3-VL) | `POST {OLLAMA_URL}/api/chat` — штатный API Ollama; JSON Schema ответа — в поле `format` | `{"message": {"content": "…"}}` |
+
+Контракт Ollama — родной. У штатных серверов остальных движков API другой (docling-serve —
+`POST /v1/convert/file`, MinerU — `POST /v1/file_parse`, PaddleOCR-VL — `POST /layout-parsing`),
+и команд `load` / `unload` у них нет: перед ними нужен тонкий адаптер под контракт из таблицы.
 
 ## Как это устроено
 
 * **Очередь к GPU** (`app/core/gpu_manager.py`). Локи Redis `lock:gpu0` и `lock:gpu1` пропускают на каждую
   видеокарту по одной задаче. Перед сменой модели на GPU 0 прежняя выгружается из VRAM. Если PaddleOCR-VL
-  простаивает дольше `PADDLE_IDLE_TTL_S`, фоновая проверка возвращает на GPU 0 основную модель — MinerU.
-* **DLP.** Промпт проверяется перед отправкой в Qwen3-VL, готовый результат — перед выдачей клиенту.
-  О маскировании сообщает `dlp_masked` в Markdown-ответе, а в JSON-ответе — предупреждение и `is_valid=false`.
+  простаивает дольше `PADDLE_IDLE_TTL_SEC`, фоновая проверка возвращает на GPU 0 основную модель — MinerU.
+* **Картинки для Qwen3-VL** (`app/core/image_ops.py`) уменьшаются до `MAX_PIXELS`, стороны кратны 32 px.
+  У чертежа вырезаются зоны штампа и техтребований — по-разному для книжного A4 и альбомных A3–A0.
 * **Валидаторы** (`app/validators/`): контрольные цифры ИНН, формат КПП и БИК, сходимость сумм в строках
   и итога документа с допуском 0,05.
-* **Асинхронные задачи** (`app/core/tasks.py`): очередь на списках Redis, воркеры (`TASK_WORKERS`) работают
-  внутри сервиса. Результат хранится `TASK_TTL_S` секунд. Задача, прерванная остановкой сервиса, после
-  запуска возвращается в очередь. Очередь задач рассчитана на один экземпляр сервиса.
+* **Фоновые задачи** (`async_mode=true`) выполняются внутри сервиса, одновременно — не больше
+  `TASK_CONCURRENCY`. При перезапуске сервиса незавершённые задачи получают статус `failed`:
+  документ нужно отправить повторно.
 
 ## Тесты
 
@@ -210,12 +212,14 @@ pip install -r requirements-dev.txt
 pytest -v
 ```
 
-Docker и сеть тестам не нужны: `mock-engines` и Redis (fakeredis) работают внутри процесса.
-Тестовые файлы в `tests/samples/` создаёт скрипт `python tests/make_samples.py`.
+Docker и сеть тестам не нужны: `mock-engines` и Redis (fakeredis) работают внутри процесса,
+тестовые PDF и PNG создаются на лету.
 
 Запуск без Docker (нужен Redis на `localhost:6379`):
 
 ```bash
 uvicorn main:app --app-dir mocks --port 8001 &
-uvicorn app.main:app --port 8000
+REDIS_URL=redis://localhost:6379/0 DOCLING_URL=http://localhost:8001/docling \
+  MINERU_URL=http://localhost:8001/mineru PADDLE_URL=http://localhost:8001/paddle \
+  OLLAMA_URL=http://localhost:8001 uvicorn app.main:app --port 8000
 ```

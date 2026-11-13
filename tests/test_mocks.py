@@ -5,128 +5,197 @@
 
 import asyncio
 import base64
-import io
 import json
 
 import httpx
 import pytest
-from PIL import Image
+from conftest import decode, make_png
 
-from mocks.main import MockState
+from app.schemas.drawing_stamp import DrawingStampCore, TechRequirementsList
+from app.schemas.invoice import InvoiceSchema
+from app.schemas.upd import UpdSchema
+from mocks.main import MERMAID, SEAL_TEXT, STAMP, TECH_REQUIREMENTS, MockState
 
 SCAN = {"file": ("scan.pdf", b"%PDF-1.7", "application/pdf")}
-CHAT_URL = "/gateway/v1/chat/completions"
 
 
-def chat(text: str, schema_title: str | None = None) -> dict:
-    """Тело запроса к Gateway: промпт и (необязательно) JSON Schema ответа."""
-    body: dict = {
-        "model": "qwen3-vl",
-        "messages": [{"role": "user", "content": [{"type": "text", "text": text}]}],
-    }
-    if schema_title:
-        body["format"] = {"title": schema_title, "type": "object"}
+def chat(prompt: str, schema: type | None = None, image: bytes | None = None) -> dict:
+    """Тело запроса к Ollama: промпт, необязательные JSON Schema ответа и картинка."""
+    message: dict = {"role": "user", "content": prompt}
+    if image:
+        message["images"] = [base64.b64encode(image).decode()]
+    body: dict = {"model": "qwen3-vl", "messages": [message], "stream": False}
+    if schema:
+        body["format"] = schema.model_json_schema()
     return body
 
 
-def answer(response: httpx.Response) -> str:
-    return response.json()["choices"][0]["message"]["content"]
+async def ask(http: httpx.AsyncClient, prompt: str, schema: type | None = None) -> str:
+    response = await http.post("/api/chat", json=chat(prompt, schema))
+    return response.json()["message"]["content"]
 
 
-async def test_docling_returns_markdown(mock_http: httpx.AsyncClient):
-    response = await mock_http.post("/docling/convert", files=SCAN)
-    assert response.json() == {"markdown": "# Документ (Docling)\nТекст цифрового документа."}
+async def test_docling_returns_markdown_with_filename(mock_http: httpx.AsyncClient):
+    files = {"file": ("отчёт.docx", b"PK")}
+    response = await mock_http.post("/docling/convert", files=files)
+    assert response.json() == {"markdown": "# Цифровой документ (отчёт.docx)\nТаблица и текст из Docling."}
 
 
-async def test_mineru_returns_placeholder_and_image(mock_http: httpx.AsyncClient):
+async def test_mineru_returns_placeholder_and_figure(mock_http: httpx.AsyncClient):
+    await mock_http.post("/mineru/load")
     result = (await mock_http.post("/mineru/extract", files=SCAN)).json()
-    assert "![fig_1](fig_1.png)" in result["markdown"]
-    assert result["images"][0]["name"] == "fig_1.png"
+
+    assert "![Схема](fig_1.png)" in result["markdown"]
+    assert "scan.pdf" in result["markdown"]
+    figure = decode(base64.b64decode(result["figures"]["fig_1.png"]))
+    assert (figure.format, figure.size) == ("PNG", (64, 64))
 
 
-async def test_paddle_returns_upd_table(mock_http: httpx.AsyncClient):
+async def test_paddle_returns_upd_table_and_seal(mock_http: httpx.AsyncClient):
+    await mock_http.post("/paddle/load")
     markdown = (await mock_http.post("/paddle/extract", files=SCAN)).json()["markdown"]
+
     assert "| № | Наименование |" in markdown
     assert "Всего к оплате: 34923.00" in markdown
+    assert SEAL_TEXT == "ПЕЧАТЬ: ООО Ромашка ОГРН 1027700132195"
+    assert SEAL_TEXT in markdown
 
 
-@pytest.mark.parametrize(("loaded", "called"), [("paddle", "mineru"), ("mineru", "paddle")])
-async def test_gpu0_oom_when_second_model_enters_vram(
-    mock_http: httpx.AsyncClient, mock: MockState, loaded, called
+@pytest.mark.parametrize(("model", "name"), [("mineru", "MinerU"), ("paddle", "PaddleOCR")])
+async def test_extract_requires_loaded_model(mock_http: httpx.AsyncClient, mock: MockState, model, name):
+    response = await mock_http.post(f"/{model}/extract", files=SCAN)
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == f"{name} not loaded"
+    assert mock.oom_errors == 0  # это не нехватка памяти
+
+
+@pytest.mark.parametrize(
+    ("loaded", "called", "detail"),
+    [
+        ("paddle", "mineru", "Simulated OOM: PaddleOCR is still in GPU 0 VRAM!"),
+        ("mineru", "paddle", "Simulated OOM: MinerU is still in GPU 0 VRAM!"),
+    ],
+)
+async def test_gpu0_oom_when_second_model_is_loaded(
+    mock_http: httpx.AsyncClient, mock: MockState, loaded, called, detail
 ):
     await mock_http.post(f"/{loaded}/load")
 
-    for action, kwargs in (("extract", {"files": SCAN}), ("load", {})):
-        response = await mock_http.post(f"/{called}/{action}", **kwargs)
-        assert response.status_code == 500
-        assert response.json()["detail"] == "Out Of Memory (Simulated)"
+    response = await mock_http.post(f"/{called}/load")
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == detail
+    assert mock.loaded == {loaded}
+    assert mock.oom_errors == 1
+
+
+async def test_gpu0_oom_when_both_models_are_in_vram(mock_http: httpx.AsyncClient, mock: MockState):
+    mock.loaded |= {"mineru", "paddle"}  # так бывает, если оркестратор забыл выгрузить модель
+
+    for model in ("mineru", "paddle"):
+        response = await mock_http.post(f"/{model}/extract", files=SCAN)
+        assert (response.status_code, response.json()["detail"]) == (500, "Simulated OOM")
     assert mock.oom_errors == 2
 
 
 async def test_gpu0_works_after_unload(mock_http: httpx.AsyncClient, mock: MockState):
     await mock_http.post("/paddle/load")
     await mock_http.post("/paddle/unload")
+    await mock_http.post("/mineru/load")
 
     response = await mock_http.post("/mineru/extract", files=SCAN)
 
     assert response.status_code == 200
-    assert mock.loaded == {"mineru"}  # модель подгрузилась лениво
+    assert mock.loaded == {"mineru"}
     assert mock.oom_errors == 0
 
 
-async def test_gateway_rejects_parallel_requests(mock_http: httpx.AsyncClient, mock: MockState):
-    responses = await asyncio.gather(*(mock_http.post(CHAT_URL, json=chat("Опиши схему")) for _ in range(3)))
+async def test_state_endpoint_reports_vram_and_violations(mock_http: httpx.AsyncClient):
+    assert (await mock_http.get("/mock/state")).json() == {
+        "mineru_loaded": False,
+        "paddle_loaded": False,
+        "oom_errors": 0,
+        "gpu1_rejects": 0,
+        "gpu0_peak": 0,
+    }
+
+    await mock_http.post("/paddle/load")
+    await mock_http.post("/paddle/extract", files=SCAN)
+    await mock_http.post("/mineru/load")  # OOM
+
+    assert (await mock_http.get("/mock/state")).json() == {
+        "mineru_loaded": False,
+        "paddle_loaded": True,
+        "oom_errors": 1,
+        "gpu1_rejects": 0,
+        "gpu0_peak": 1,
+    }
+
+
+async def test_vlm_rejects_parallel_requests(mock_http: httpx.AsyncClient, mock: MockState):
+    requests = [mock_http.post("/api/chat", json=chat("Опиши схему")) for _ in range(3)]
+
+    responses = await asyncio.gather(*requests)
 
     assert sorted(r.status_code for r in responses) == [200, 429, 429]
-    assert "Too Many Concurrent Requests on GPU 1" in next(r.text for r in responses if r.status_code == 429)
-    assert mock.gateway_rejects == 2
+    rejected = next(r for r in responses if r.status_code == 429)
+    assert rejected.json()["detail"] == "GPU 1 Busy: Concurrent VLM request!"
+    assert mock.gpu1_rejects == 2
 
 
-def with_image(body: dict, width: int, height: int) -> dict:
-    """Добавляет в запрос PNG-картинку заданного размера."""
-    buffer = io.BytesIO()
-    Image.new("L", (width, height)).save(buffer, "PNG")
-    url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
-    body["messages"][0]["content"].append({"type": "image_url", "image_url": {"url": url}})
-    return body
-
-
-async def test_gateway_oom_on_oversized_image(mock_http: httpx.AsyncClient, mock: MockState):
-    fits = await mock_http.post(CHAT_URL, json=with_image(chat("Опиши схему"), 1280, 1000))
-    too_big = await mock_http.post(CHAT_URL, json=with_image(chat("Опиши схему"), 1281, 1000))
+async def test_vlm_oom_on_oversized_image(mock_http: httpx.AsyncClient, mock: MockState):
+    fits = await mock_http.post("/api/chat", json=chat("Опиши схему", image=make_png(1280, 1000)))
+    too_big = await mock_http.post("/api/chat", json=chat("Опиши схему", image=make_png(1281, 1000)))
 
     assert fits.status_code == 200
     assert too_big.status_code == 500
-    assert too_big.json()["detail"] == "Out Of Memory (Simulated)"
+    assert "Simulated OOM" in too_big.json()["detail"]
     assert mock.images == [(1280, 1000), (1281, 1000)]
     assert mock.oom_errors == 1
 
 
-async def test_gateway_describes_image_with_mermaid(mock_http: httpx.AsyncClient):
-    response = await mock_http.post(CHAT_URL, json=chat("Опиши схему"))
-    assert answer(response) == "```mermaid\ngraph TD; A-->B;\n```"
+async def test_vlm_describes_figure_with_mermaid(mock_http: httpx.AsyncClient):
+    response = await mock_http.post("/api/chat", json=chat("Переведи схему в Mermaid"))
+
+    assert response.json()["message"] == {"role": "assistant", "content": MERMAID}
+    assert MERMAID == "```mermaid\ngraph TD;\n  A[Вход] --> B[Обработка];\n```"
 
 
-async def test_gateway_answers_by_schema(mock_http: httpx.AsyncClient):
-    stamp = json.loads(answer(await mock_http.post(CHAT_URL, json=chat("Штамп", "DrawingStampSchema"))))
+async def test_vlm_answers_drawing_schemas(mock_http: httpx.AsyncClient):
+    stamp = json.loads(await ask(mock_http, "Штамп", DrawingStampCore))
+    requirements = json.loads(await ask(mock_http, "Техтребования", TechRequirementsList))
+
+    assert stamp == STAMP
     assert stamp == {
-        "designation": "АБВГ.123456.001",
+        "designation": "АБВГ.711141.001",
         "title": "Вал приводной",
         "material": "Сталь 45 ГОСТ 1050-2013",
         "mass": "12.5",
+        "scale": "1:1",
+        "organization": "АО КБ Маш",
     }
+    assert requirements == TECH_REQUIREMENTS
+    assert requirements["requirements"][1] == "2. Острые кромки притупить R0,5."
 
-    good = json.loads(answer(await mock_http.post(CHAT_URL, json=chat("Файл: upd.pdf", "UpdSchema"))))
-    bad = json.loads(answer(await mock_http.post(CHAT_URL, json=chat("Файл: bad_inn.pdf", "UpdSchema"))))
-    assert good["seller"]["inn"] == "7701234560"
+
+@pytest.mark.parametrize("schema", [UpdSchema, InvoiceSchema])
+async def test_vlm_returns_valid_document_by_schema(mock_http: httpx.AsyncClient, schema):
+    answer = json.loads(await ask(mock_http, "Файл: upd.pdf", schema))
+
+    assert set(answer) == set(schema.model_fields)  # только поля запрошенной схемы
+    document = schema.model_validate(answer)
+    assert (document.seller.inn, document.seller.kpp) == ("7707083893", "770701001")
+    assert sum(item.row_total for item in document.items) == document.total_with_vat
+    if schema is InvoiceSchema:
+        assert document.bank.bik == "044525225"
+
+
+async def test_vlm_returns_broken_document_for_bad_inn(mock_http: httpx.AsyncClient):
+    bad = json.loads(await ask(mock_http, "Файл: bad_inn.pdf", UpdSchema))
+
     assert bad["seller"]["inn"] == "7701234569"
-    assert bad["document_total"] != good["document_total"]
-
-
-async def test_dlp_masks_secret_and_passport(mock_http: httpx.AsyncClient):
-    text = "Токен SECRET_TOKEN, паспорт 4510 123456, ИНН 7701234560"
-    result = (await mock_http.post("/dlp/inspect", json={"text": text})).json()
-    assert result == {"text": "Токен [REDACTED], паспорт [REDACTED], ИНН 7701234560", "masked": True}
-
-    clean = (await mock_http.post("/dlp/inspect", json={"text": "Обычный текст"})).json()
-    assert clean == {"text": "Обычный текст", "masked": False}
+    (item,) = bad["items"]
+    assert (item["qty"], item["price"], item["amount_without_vat"]) == (2, 500, 1000)
+    assert (item["vat_amount"], item["row_total"]) == (200, 1200)
+    assert bad["total_with_vat"] == 1500

@@ -21,7 +21,6 @@ class DocType(StrEnum):
 
     UPD = "upd"
     INVOICE = "invoice"
-    CONTRACT = "contract"
     DRAWING = "drawing"
 
 
@@ -67,7 +66,7 @@ class TradeDocument(BaseModel):
     seller: Counterparty
     buyer: Counterparty
     items: list[LineItem]
-    document_total: Number  # всего к оплате с НДС
+    total_with_vat: Number  # всего к оплате с НДС
 
 
 # --- Ответы API ---------------------------------------------------------------------------
@@ -75,8 +74,8 @@ class TradeDocument(BaseModel):
 
 class ProcessMetadata(BaseModel):
     filename: str
-    engine_used: str  # движки через «+», например «mineru+qwen3vl»
-    dlp_masked: bool  # замаскировал ли DLP что-нибудь в тексте
+    route: str  # маршрут обработки (RouteType), например «SCAN_PDF»
+    engine_used: str  # движки через «+», например «mineru+qwen3-vl»; «none» — файл отдан как есть
 
 
 class ProcessResponse(BaseModel):

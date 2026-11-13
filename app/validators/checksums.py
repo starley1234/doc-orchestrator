@@ -1,4 +1,7 @@
-"""Проверка реквизитов: контрольные цифры ИНН, формат КПП и БИК (защита от галлюцинаций VLM)."""
+"""Проверка реквизитов: контрольные цифры ИНН, формат КПП и БИК (защита от галлюцинаций VLM).
+
+Пустое значение (None или «») реквизитом не считается: все проверки возвращают False.
+"""
 
 import re
 
@@ -18,9 +21,10 @@ def _control_digit(digits: list[int], weights: tuple[int, ...]) -> int:
     return sum(weight * digits[i] for i, weight in enumerate(weights)) % 11 % 10
 
 
-def validate_inn(inn: str) -> bool:
+def validate_inn(inn: str | None) -> bool:
     """ИНН: 10 цифр (юрлицо) или 12 цифр (ИП, физлицо) с верными контрольными цифрами."""
-    if not (inn.isascii() and inn.isdigit()) or inn.startswith("00"):  # кода региона 00 не существует
+    # Кода региона 00 не существует, а «0000000000» формально проходит контрольную сумму
+    if not inn or not (inn.isascii() and inn.isdigit()) or inn.startswith("00"):
         return False
     digits = [int(char) for char in inn]
     weight_sets = _INN_WEIGHTS.get(len(digits))
@@ -29,11 +33,11 @@ def validate_inn(inn: str) -> bool:
     return all(digits[len(weights)] == _control_digit(digits, weights) for weights in weight_sets)
 
 
-def validate_kpp(kpp: str) -> bool:
+def validate_kpp(kpp: str | None) -> bool:
     """КПП: 9 символов — 4 цифры, 2 цифры или заглавные латинские буквы, 3 цифры."""
-    return _KPP_RE.fullmatch(kpp) is not None
+    return _KPP_RE.fullmatch(kpp or "") is not None
 
 
-def validate_bik(bik: str) -> bool:
+def validate_bik(bik: str | None) -> bool:
     """БИК: 9 цифр, начинается с 04 (код России)."""
-    return _BIK_RE.fullmatch(bik) is not None
+    return _BIK_RE.fullmatch(bik or "") is not None

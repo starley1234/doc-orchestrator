@@ -13,10 +13,10 @@ from fakeredis import FakeAsyncRedis, FakeServer
 
 from app.clients.base import GpuEngineClient
 from app.clients.paddle import PaddleClient
-from app.clients.vlm_gateway import VlmGatewayClient
+from app.clients.vlm import VlmClient
 from app.config import Settings
 from app.core.errors import EngineError, GPUBusyError
-from app.core.gpu_manager import KEY_ACTIVE_MODEL, GPUResourceManager
+from app.core.gpu_manager import KEY_ACTIVE_MODEL, LOCK_GPU0, LOCK_GPU1, GPUResourceManager
 from mocks.main import MockState
 
 SCAN = (b"%PDF-1.7 scan", "scan.pdf")
@@ -25,7 +25,7 @@ Engines = dict[str, GpuEngineClient]
 
 @pytest.fixture
 def make_gpu(redis: FakeAsyncRedis, engines: Engines, settings: Settings):
-    """Фабрика менеджеров с изменёнными настройками, например make_gpu(paddle_idle_ttl_s=0.1)."""
+    """Фабрика менеджеров с изменёнными настройками, например make_gpu(paddle_idle_ttl_sec=0.1)."""
 
     def make(**overrides: float) -> GPUResourceManager:
         return GPUResourceManager(redis, engines, settings.model_copy(update=overrides))
@@ -37,6 +37,14 @@ async def use_gpu0(gpu: GPUResourceManager, engines: Engines, model: str) -> Non
     """Типичная задача OCR: занять GPU 0 с нужной моделью и распознать документ."""
     async with gpu.acquire_gpu0(model):
         await engines[model].extract(*SCAN)
+
+
+async def use_gpu0_without_queue(engines: Engines, model: str) -> None:
+    """Та же задача без менеджера: сама выгружает соседнюю модель и загружает свою."""
+    neighbour = "paddle" if model == "mineru" else "mineru"
+    await engines[neighbour].unload()
+    await engines[model].load()
+    await engines[model].extract(*SCAN)
 
 
 async def wait_for_model(gpu: GPUResourceManager, model: str) -> None:
@@ -91,6 +99,29 @@ async def test_recovers_when_redis_state_is_lost(
     assert mock.oom_errors == 0
 
 
+async def test_model_is_reloaded_after_engine_restart(
+    gpu: GPUResourceManager, engines: Engines, mock: MockState
+):
+    await use_gpu0(gpu, engines, "mineru")
+    mock.loaded.clear()  # движок перезапустился: в VRAM пусто, а в Redis записано «mineru»
+
+    with pytest.raises(EngineError, match="MinerU not loaded"):
+        await use_gpu0(gpu, engines, "mineru")
+    assert await gpu.active_model() == "none"  # состояние сброшено: что в VRAM, теперь неизвестно
+
+    await use_gpu0(gpu, engines, "mineru")  # следующая задача загружает модель заново
+    assert mock.loaded == {"mineru"}
+
+
+async def test_task_failure_unrelated_to_engines_keeps_the_model(gpu: GPUResourceManager, mock: MockState):
+    with pytest.raises(RuntimeError):
+        async with gpu.acquire_gpu0("paddle"):
+            raise RuntimeError("задача упала")
+
+    assert await gpu.active_model() == "paddle"
+    assert mock.loaded == {"paddle"}
+
+
 async def test_failed_load_leaves_consistent_state(
     redis: FakeAsyncRedis, mock_http: httpx.AsyncClient, engines: Engines, settings: Settings, mock: MockState
 ):
@@ -140,7 +171,8 @@ async def test_concurrent_tasks_never_share_gpu0(gpu: GPUResourceManager, engine
 async def test_without_manager_concurrent_tasks_crash(engines: Engines, mock: MockState):
     # Контрольный опыт: те же задачи без очереди к GPU приводят к OOM
     results = await asyncio.gather(
-        *(engines[model].extract(*SCAN) for model in ["mineru", "paddle"] * 4), return_exceptions=True
+        *(use_gpu0_without_queue(engines, model) for model in ["mineru", "paddle"] * 4),
+        return_exceptions=True,
     )
 
     assert any(isinstance(result, EngineError) for result in results)
@@ -150,7 +182,7 @@ async def test_without_manager_concurrent_tasks_crash(engines: Engines, mock: Mo
 async def test_gpu1_requests_go_one_by_one(
     gpu: GPUResourceManager, mock_http: httpx.AsyncClient, settings: Settings, mock: MockState
 ):
-    vlm = VlmGatewayClient(mock_http, settings.vlm_gateway_url, settings.vlm_model)
+    vlm = VlmClient(mock_http, settings.ollama_url, settings.vlm_model, settings.vlm_num_ctx)
 
     async def ask(n: int) -> str:
         async with gpu.acquire_gpu1():
@@ -159,7 +191,7 @@ async def test_gpu1_requests_go_one_by_one(
     answers = await asyncio.gather(*(ask(n) for n in range(5)))
 
     assert len(answers) == len(mock.prompts) == 5
-    assert mock.gateway_rejects == 0
+    assert mock.gpu1_rejects == 0
 
 
 async def test_gpu0_and_gpu1_are_independent(gpu: GPUResourceManager):
@@ -184,8 +216,20 @@ async def test_lock_is_shared_between_service_instances(
         await redis.aclose()
 
 
+async def test_locks_use_timeouts_from_the_spec(redis: FakeAsyncRedis, engines: Engines):
+    defaults = Settings(_env_file=None)
+    gpu = GPUResourceManager(redis, engines, defaults)
+
+    assert (defaults.gpu_lock_timeout_sec, defaults.gpu_lock_wait_sec) == (300, 300)
+    assert (defaults.paddle_idle_ttl_sec, defaults.gpu0_check_interval_sec) == (120, 15)
+    async with gpu.acquire_gpu0("mineru"), gpu.acquire_gpu1():
+        for lock in (LOCK_GPU0, LOCK_GPU1):
+            assert 299_000 < await redis.pttl(lock) <= 300_000  # TTL лока — 300 секунд
+    assert await redis.exists(LOCK_GPU0, LOCK_GPU1) == 0  # после работы локи сняты
+
+
 async def test_waiting_too_long_raises_gpu_busy(make_gpu):
-    gpu = make_gpu(gpu_wait_timeout_s=0.2)
+    gpu = make_gpu(gpu_lock_wait_sec=0.2)
 
     async with gpu.acquire_gpu1():
         started = time.monotonic()
@@ -207,7 +251,7 @@ async def test_lock_is_released_when_task_fails(gpu: GPUResourceManager):
 
 async def test_long_task_keeps_the_lock(make_gpu):
     # TTL лока (0.3 с) меньше длительности задачи (1 с): лок обязан продлеваться, пока задача работает
-    gpu = make_gpu(gpu_lock_timeout_s=0.3)
+    gpu = make_gpu(gpu_lock_timeout_sec=0.3)
     events: list[str] = []
 
     async def task(name: str, duration: float) -> None:
@@ -226,7 +270,7 @@ async def test_long_task_keeps_the_lock(make_gpu):
 async def test_release_never_hangs_when_lock_is_being_extended(make_gpu):
     # Лок продлевается каждые 2 мс, поэтому выход из блока часто совпадает с командой продления.
     # Регрессия: отмена, «проглоченная» внутри клиента Redis, навсегда подвешивала выход из блока.
-    gpu = make_gpu(gpu_lock_timeout_s=0.006)
+    gpu = make_gpu(gpu_lock_timeout_sec=0.006)
 
     async with asyncio.timeout(10):
         for n in range(100):
@@ -238,7 +282,7 @@ async def test_release_never_hangs_when_lock_is_being_extended(make_gpu):
 
 
 async def test_idle_paddle_is_replaced_by_mineru(make_gpu, mock: MockState):
-    gpu = make_gpu(paddle_idle_ttl_s=0.1)
+    gpu = make_gpu(paddle_idle_ttl_sec=0.1)
     async with gpu.acquire_gpu0("paddle"):
         mock.calls.clear()
 
@@ -252,7 +296,7 @@ async def test_idle_paddle_is_replaced_by_mineru(make_gpu, mock: MockState):
 
 
 async def test_idle_timer_counts_from_the_end_of_last_task(make_gpu, engines: Engines):
-    gpu = make_gpu(paddle_idle_ttl_s=0.2)
+    gpu = make_gpu(paddle_idle_ttl_sec=0.2)
     await use_gpu0(gpu, engines, "paddle")
     await asyncio.sleep(0.15)
     await use_gpu0(gpu, engines, "paddle")  # новая задача обнуляет простой
@@ -263,7 +307,7 @@ async def test_idle_timer_counts_from_the_end_of_last_task(make_gpu, engines: En
 
 
 async def test_idle_mineru_stays_loaded(make_gpu, mock: MockState):
-    gpu = make_gpu(paddle_idle_ttl_s=0.05)
+    gpu = make_gpu(paddle_idle_ttl_sec=0.05)
     async with gpu.acquire_gpu0("mineru"):
         mock.calls.clear()
     await asyncio.sleep(0.1)
@@ -273,12 +317,12 @@ async def test_idle_mineru_stays_loaded(make_gpu, mock: MockState):
 
 
 async def test_paddle_is_not_unloaded_while_gpu0_is_busy(make_gpu, mock: MockState):
-    gpu = make_gpu(paddle_idle_ttl_s=0.05)
+    gpu = make_gpu(paddle_idle_ttl_sec=0.05)
     async with gpu.acquire_gpu0("paddle"):
         mock.calls.clear()
     await asyncio.sleep(0.1)  # paddle «простаивает», но тут приходит новая задача
 
-    async with gpu.acquire_gpu0("paddle"):
+    async with gpu.acquire_gpu0("paddle"), asyncio.timeout(1):  # проверка не ждёт, пока GPU 0 освободится
         assert not await gpu.release_idle_paddle()
 
     assert mock.calls == []
@@ -286,7 +330,7 @@ async def test_paddle_is_not_unloaded_while_gpu0_is_busy(make_gpu, mock: MockSta
 
 
 async def test_background_watcher_returns_gpu0_to_mineru(make_gpu, engines: Engines, mock: MockState):
-    gpu = make_gpu(paddle_idle_ttl_s=0.1, idle_check_interval_s=0.05)
+    gpu = make_gpu(paddle_idle_ttl_sec=0.1, gpu0_check_interval_sec=0.05)
     gpu.start()
     try:
         await use_gpu0(gpu, engines, "paddle")
@@ -303,7 +347,7 @@ async def test_watcher_survives_engine_failure(
 ):
     # Первые попытки выгрузить paddle падают (движок «недоступен»), потом движок оживает
     flaky = PaddleClient(mock_http, f"{MOCK_URL}/no-such-engine")
-    quick = settings.model_copy(update={"paddle_idle_ttl_s": 0.05, "idle_check_interval_s": 0.05})
+    quick = settings.model_copy(update={"paddle_idle_ttl_sec": 0.05, "gpu0_check_interval_sec": 0.05})
     gpu = GPUResourceManager(redis, {**engines, "paddle": flaky}, quick)
     await redis.set(KEY_ACTIVE_MODEL, "paddle")
     mock.loaded.add("paddle")

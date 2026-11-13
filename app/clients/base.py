@@ -24,7 +24,7 @@ def file_part(file_bytes: bytes, filename: str) -> dict[str, tuple[str, bytes, s
 
 
 class EngineClient:
-    """HTTP-клиент одного внешнего сервиса. Любой сбой превращает в EngineError."""
+    """HTTP-клиент одного ML-движка. Любой сбой превращает в EngineError."""
 
     name = "Движок"  # название сервиса для сообщений об ошибках
 

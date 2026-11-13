@@ -2,7 +2,7 @@
 
 from functools import lru_cache
 
-from pydantic import PositiveFloat, PositiveInt
+from pydantic import Field, PositiveFloat, PositiveInt
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,39 +12,38 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     log_level: str = "INFO"
-    redis_url: str = "redis://localhost:6379/0"
+    redis_url: str = "redis://redis:6379/0"
 
-    # --- Внешние движки ---
-    # По умолчанию — локальный mock-engines. В проде меняются только эти URL.
-    docling_url: str = "http://localhost:8001/docling"
-    mineru_url: str = "http://localhost:8001/mineru"
-    paddle_url: str = "http://localhost:8001/paddle"
-    vlm_gateway_url: str = "http://localhost:8001/gateway"
-    dlp_url: str = "http://localhost:8001/dlp"
-    vlm_model: str = "qwen3-vl"
+    # --- ML-движки ---
+    # По умолчанию — заглушка mock-engines из docker-compose.yml.
+    # На боевом сервере меняются только эти адреса.
+    docling_url: str = "http://mock-engines:8001/docling"
+    mineru_url: str = "http://mock-engines:8001/mineru"
+    paddle_url: str = "http://mock-engines:8001/paddle"
+    ollama_url: str = "http://mock-engines:8001"  # боевой Ollama: http://ollama:11434
+    vlm_model: str = "qwen3-vl:4b-instruct-q8_0"  # строго instruct-вариант, не thinking
+    vlm_num_ctx: PositiveInt = 8192  # окно контекста модели, токенов
 
     # --- Доступ ---
-    # Если задан, PUT /process требует заголовок Authorization: Bearer <токен>
-    openwebui_api_token: str | None = None
+    api_key: str = ""  # если задан, PUT /process требует заголовок Authorization: Bearer <ключ>
 
     # --- Таймауты, секунды ---
-    http_timeout_s: PositiveFloat = 300  # один HTTP-запрос к движку (OCR большого скана идёт минуты)
-    gpu_lock_timeout_s: PositiveFloat = 300  # TTL лока GPU: страховка на случай падения процесса
-    gpu_wait_timeout_s: PositiveFloat = 600  # сколько задача ждёт своей очереди к GPU
-    paddle_idle_ttl_s: PositiveFloat = 120  # простой paddle, после которого GPU 0 возвращается mineru
-    idle_check_interval_s: PositiveFloat = 30  # период фоновой проверки простоя
+    http_timeout_sec: PositiveFloat = 300  # один HTTP-запрос к движку (OCR большого скана идёт минуты)
+    gpu_lock_timeout_sec: PositiveFloat = 300  # TTL лока GPU: страховка на случай падения процесса
+    gpu_lock_wait_sec: PositiveFloat = 300  # сколько задача ждёт своей очереди к GPU
+    paddle_idle_ttl_sec: PositiveFloat = 120  # простой paddle, после которого GPU 0 возвращается mineru
+    gpu0_check_interval_sec: PositiveFloat = 15  # период фоновой проверки простоя
 
-    # --- Файлы, изображения и текст для Qwen3-VL ---
+    # --- Файлы и изображения ---
     max_file_size_mb: PositiveInt = 50  # файлы крупнее отклоняются (HTTP 413)
-    max_pixels: PositiveInt = 1_280_000  # больше пикселей — модель не поместится в 8 ГБ VRAM
-    render_dpi: PositiveInt = 200  # рендер страниц PDF
-    drawing_dpi: PositiveInt = 300  # рендер чертежей (нужны мелкие надписи штампа)
-    vlm_max_text_chars: PositiveInt = 20_000  # предел распознанного текста в промпте
+    max_pixels: int = Field(1_280_000, ge=32 * 32)  # предел картинки для Qwen3-VL (8 ГБ VRAM)
+    overview_dpi: PositiveInt = 150  # рендер первой страницы документа для Qwen3-VL
+    drawing_dpi: PositiveInt = 300  # рендер чертежа: нужны мелкие надписи штампа
+    vlm_max_text_chars: PositiveInt = 8000  # предел распознанного текста в промпте (чтобы влез в VLM_NUM_CTX)
 
     # --- Асинхронные задачи (async_mode=true) ---
-    task_workers: PositiveInt = 2  # по числу GPU: одна задача на OCR, другая на VLM
-    task_ttl_s: PositiveInt = 86_400  # сколько хранится результат задачи
-    task_poll_interval_s: PositiveFloat = 0.5  # как часто свободный воркер проверяет очередь
+    task_ttl_sec: PositiveInt = 3600  # сколько хранится состояние и результат задачи
+    task_concurrency: PositiveInt = 2  # сколько задач обрабатывается одновременно, остальные ждут
 
 
 @lru_cache
