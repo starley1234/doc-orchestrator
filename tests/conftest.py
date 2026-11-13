@@ -78,7 +78,7 @@ def settings() -> Settings:
         paddle_url=f"{MOCK_URL}/paddle",
         vlm_gateway_url=f"{MOCK_URL}/gateway",
         dlp_url=f"{MOCK_URL}/dlp",
-        gpu_wait_timeout_s=20,
+        gpu_wait_timeout_s=120,  # зависшая очередь к GPU уронит тест, а не подвесит его на 10 минут
         idle_check_interval_s=0.05,
         task_poll_interval_s=0.02,
     )
