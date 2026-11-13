@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Тестовые образцы — бинарные файлы: без преобразования переводов строк
+*.pdf binary
+*.png binary
