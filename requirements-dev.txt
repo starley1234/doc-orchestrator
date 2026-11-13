@@ -1,0 +1,7 @@
+# Зависимости для разработки и тестов: pip install -r requirements-dev.txt
+-r requirements.txt
+pytest==9.2.0
+pytest-asyncio==1.5.0
+# Redis внутри процесса (тестам не нужен сервер); lua — для распределённых локов
+fakeredis[lua]==2.40.0
+ruff==0.17.5

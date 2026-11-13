@@ -1,0 +1,12 @@
+# Зависимости сервиса. Версии зафиксированы, чтобы сборка образа была воспроизводимой.
+fastapi==0.162.5
+uvicorn==0.54.0
+pydantic==2.14.3
+pydantic-settings==2.16.2
+redis==8.1.0
+httpx==0.28.1
+# Ветка 1.x: PyMuPDF 2.x тянет onnxruntime и numpy, которые оркестратору не нужны
+PyMuPDF==1.28.2
+Pillow==13.0.0
+# Нужен FastAPI для разбора multipart/form-data
+python-multipart==0.0.33
