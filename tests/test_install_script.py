@@ -792,6 +792,27 @@ def test_all_pauses_for_reboot_then_finishes_and_is_repeatable(make_server):
     assert server.read()["vram_conflicts"] == 0
 
 
+def test_log_is_complete_when_script_exits(make_server):
+    """Журнал пишет фоновый процесс: скрипт дожидается его и только потом возвращает управление."""
+    server = make_server(installed_server(containers={}))  # шаг models завершится ошибкой: стека нет
+    tee = shutil.which("tee")
+    (server.bin / "tee").unlink()
+    (server.bin / "tee").write_text(f'#!/bin/sh\n/bin/sleep 0.5\nexec {tee} "$@"\n')  # медленный диск
+    (server.bin / "tee").chmod(0o755)
+
+    script = subprocess.Popen(
+        [BASH, str(server.repo / "deploy/install.sh"), "models"],
+        env=server.env(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    assert script.wait(timeout=60) == 1
+
+    log = (server.sysroot / "var/log/ai-doc-stack-install.log").read_text()
+    assert "ОШИБКА: контейнер ollama-vlm не запущен" in log
+
+
 def test_dry_run_shows_commands_and_changes_nothing(make_server):
     server = make_server(new_state(uid=1000))  # пробный запуск не требует root
     before = server.read()

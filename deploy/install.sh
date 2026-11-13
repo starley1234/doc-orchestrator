@@ -30,6 +30,7 @@ LOG_FILE="$SYSROOT/var/log/ai-doc-stack-install.log"
 ASSUME_YES=""        # --yes: не задавать вопросов
 DRY_RUN=""           # --dry-run: показывать команды, но не выполнять
 REBOOT_NEEDED=""     # шаг driver поставил драйвер: дальше — только после перезагрузки
+LOG_WRITER=""        # процесс, который пишет вывод в журнал
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -105,6 +106,10 @@ start_log() {
     [ -z "$DRY_RUN" ] || return 0
     mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null && touch "$LOG_FILE" 2>/dev/null || return 0
     exec > >(tee -a "$LOG_FILE") 2>&1
+    LOG_WRITER=$!
+    # Вывод дублирует в журнал фоновый tee. Перед выходом дожидаемся его: иначе последние строки —
+    # а это бывает сообщение об ошибке — появились бы на экране уже после приглашения оболочки
+    trap 'exec >&- 2>&-; wait "$LOG_WRITER" 2>/dev/null || true' EXIT
     printf '\n===== %s: install.sh %s =====\n' "$(date '+%F %T')" "$COMMAND"
 }
 
