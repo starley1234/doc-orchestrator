@@ -1,2 +1,13 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Скрипты и настройки для Linux-сервера: всегда LF, даже если репозиторий клонирован в Windows
+*.sh text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+Dockerfile text eol=lf
+.env.example text eol=lf
+
+# Образцы для проверки движков — двоичные файлы
+*.pdf binary
+*.png binary

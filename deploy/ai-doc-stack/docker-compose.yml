@@ -1,0 +1,158 @@
+# OCR/VLM-стек из «ИНСТРУКЦИЯ_ПО_УСТАНОВКЕ_OCR.md» (раздел 6).
+# deploy/install.sh кладёт этот файл в /opt/ai-doc-stack/docker-compose.yml.
+# Настройки — в файле .env рядом (образец — .env.example); без него работают значения по умолчанию.
+
+services:
+  # 1. Redis — очередь задач и GPU-семафоры doc-orchestrator
+  redis:
+    image: redis:7-alpine
+    container_name: doc-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - ./redis:/data
+    networks:
+      - doc-net
+
+  # 2. Docling Serve v1.38.2 (CPU) — цифровые PDF, DOCX, XLSX, PPTX (модели уже в образе)
+  # WebUI: http://IP:5001/ui | Swagger: http://IP:5001/docs
+  docling:
+    image: quay.io/docling-project/docling-serve-cpu:v1.38.2
+    container_name: docling-serve
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDR:-0.0.0.0}:5001:5001"
+    environment:
+      - DOCLING_SERVE_ENABLE_UI=true
+      - DOCLING_SERVE_ENG_LOC_NUM_WORKERS=2
+      - DOCLING_SERVE_ENG_LOC_SHARE_MODELS=true   # Не дублировать модели в RAM между потоками
+      - DOCLING_SERVE_MAX_SYNC_WAIT=300           # Запас по таймауту для больших PDF на 4 ядрах
+      - OMP_NUM_THREADS=4
+      - MKL_NUM_THREADS=4
+    cpus: 4.0
+    mem_limit: 8g
+    networks:
+      - doc-net
+
+  # 3. GPU 1 (Вторая RTX 2070S, 8 ГБ): Ollama для Qwen3-VL Instruct (чертежи, схемы, JSON)
+  ollama-vlm:
+    image: ollama/ollama:latest
+    container_name: ollama-vlm
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDR:-0.0.0.0}:11434:11434"
+    environment:
+      - OLLAMA_NUM_PARALLEL=1          # Строго 1 запрос одновременно для 8 ГБ VRAM
+      - OLLAMA_MAX_LOADED_MODELS=1     # Только 1 VLM в видеопамяти
+      - OLLAMA_FLASH_ATTENTION=1       # Обязателен для квантования KV-кэша
+      - OLLAMA_KV_CACHE_TYPE=q8_0      # Вдвое сжимает KV-кэш без потери точности OCR
+      - OLLAMA_KEEP_ALIVE=24h
+    volumes:
+      - ./ollama:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['1']        # Монтирует строго вторую карту (GPU 1)
+              capabilities: [gpu]
+    networks:
+      - doc-net
+
+  # 4A. GPU 0 (Первая RTX 2070S, 8 ГБ): MinerU 4 API
+  # Уровень задаёт MINERU_TIER (.env). standard: текст читает VLM-модель MinerU2.5-Pro — она
+  # понимает кириллицу; vLLM резервирует под неё 6 ГБ VRAM, остальное занимают малые модели.
+  # basic: только малые модели (~4 ГБ), но их OCR (PP-OCRv6) кириллицу НЕ распознаёт.
+  mineru-api:
+    image: mineru:4
+    container_name: mineru-api
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDR:-0.0.0.0}:8002:8000"
+    environment:
+      - MINERU_MODEL_SOURCE=local
+    entrypoint: ["mineru-kit"]
+    command:
+      - api-server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --tier
+      - ${MINERU_TIER:-standard}
+      - --concurrency
+      - "1"
+      - --preload-models               # Модели грузятся при старте: /v1/health отвечает, когда VRAM уже занята
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/v1/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s               # Пока грузятся модели, сервер не отвечает — это не сбой
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']        # Монтирует строго первую карту (GPU 0)
+              capabilities: [gpu]
+    networks:
+      - doc-net
+
+  # 4B. Опциональный браузерный интерфейс MinerU (:7860)
+  # Своих моделей не грузит: отправляет задачи в mineru-api
+  mineru-webui:
+    image: mineru:4
+    container_name: mineru-webui
+    restart: unless-stopped
+    profiles: ["webui"]
+    ports:
+      - "${BIND_ADDR:-0.0.0.0}:7860:7860"
+    environment:
+      - MINERU_MODEL_SOURCE=local
+    entrypoint: ["mineru-kit"]
+    command:
+      - webui
+      - --server-name
+      - 0.0.0.0
+      - --server-port
+      - "7860"
+      - --api-url
+      - http://mineru-api:8000
+    ipc: host
+    networks:
+      - doc-net
+
+  # 5. GPU 0 (Слот под печати и тяжёлую первичку): PaddleOCR-VL-1.6 (0.9B) + PP-DocLayoutV3
+  # ВНИМАНИЕ: Запускать ТОЛЬКО после `docker stop mineru-api`, чтобы уложиться в 8 ГБ на GPU 0!
+  # Когда подключён doc-orchestrator, контейнеры GPU 0 переключает он сам (через engine-gateway).
+  paddle-vl:
+    image: edgaras0x4e/paddleocr-pdf-api:v0.5.0-vl-baked
+    container_name: paddle-gpu0
+    restart: unless-stopped            # После перезагрузки сервера поднимется тот движок GPU 0, что работал до неё
+    profiles: ["manual-paddle"]
+    ports:
+      - "${BIND_ADDR:-0.0.0.0}:8003:8000"
+    environment:
+      - OCR_ENGINE=vl
+      - OCR_DPI=${PADDLE_OCR_DPI:-150} # Меньше DPI — меньше пик видеопамяти (по умолчанию у образа 200)
+      - OCR_MARKDOWN_IGNORE_LABELS=    # Пусто = НЕ вырезать шапки, подвалы, номера УПД и штампы!
+    volumes:
+      - ./paddle:/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    networks:
+      - doc-net
+
+networks:
+  doc-net:
+    external: true

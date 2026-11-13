@@ -1,0 +1,41 @@
+# Тестовый стенд: оркестратор + Redis + заглушка ML-движков. Настраивать ничего не нужно:
+# по умолчанию сервис обращается к redis и mock-engines этого стенда (см. app/config.py).
+# Для боевого сервера с настоящими движками есть docker-compose.prod.yml.
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mock-engines:
+    build: ./mocks
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as r; r.urlopen('http://127.0.0.1:8001/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  doc-orchestrator:
+    build: .
+    image: doc-orchestrator
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      mock-engines:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as r; r.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
