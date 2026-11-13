@@ -13,6 +13,12 @@ class UnsupportedFileError(OrchestratorError):
     status_code = 415
 
 
+class FileTooLargeError(OrchestratorError):
+    """Файл больше допустимого размера."""
+
+    status_code = 413
+
+
 class InvalidFileError(OrchestratorError):
     """Файл повреждён, защищён паролем или не читается."""
 

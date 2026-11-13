@@ -34,7 +34,8 @@ class Settings(BaseSettings):
     paddle_idle_ttl_s: PositiveFloat = 120  # простой paddle, после которого GPU 0 возвращается mineru
     idle_check_interval_s: PositiveFloat = 30  # период фоновой проверки простоя
 
-    # --- Изображения и текст для Qwen3-VL ---
+    # --- Файлы, изображения и текст для Qwen3-VL ---
+    max_file_size_mb: PositiveInt = 50  # файлы крупнее отклоняются (HTTP 413)
     max_pixels: PositiveInt = 1_280_000  # больше пикселей — модель не поместится в 8 ГБ VRAM
     render_dpi: PositiveInt = 200  # рендер страниц PDF
     drawing_dpi: PositiveInt = 300  # рендер чертежей (нужны мелкие надписи штампа)
@@ -43,6 +44,7 @@ class Settings(BaseSettings):
     # --- Асинхронные задачи (async_mode=true) ---
     task_workers: PositiveInt = 2  # по числу GPU: одна задача на OCR, другая на VLM
     task_ttl_s: PositiveInt = 86_400  # сколько хранится результат задачи
+    task_poll_interval_s: PositiveFloat = 0.5  # как часто свободный воркер проверяет очередь
 
 
 @lru_cache

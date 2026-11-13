@@ -1,10 +1,12 @@
 """Общие фикстуры. Мок движков работает внутри процесса: тестам не нужны ни Docker, ни сеть."""
 
+import json
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import httpx
 import pytest
-from fakeredis import FakeAsyncRedis
+from fakeredis import FakeAsyncRedis, FakeServer
 from fastapi import FastAPI
 from make_samples import SAMPLES, SAMPLES_DIR
 
@@ -13,7 +15,8 @@ from app.clients.mineru import MineruClient
 from app.clients.paddle import PaddleClient
 from app.config import Settings
 from app.core.gpu_manager import GPUResourceManager
-from mocks.main import MockState
+from app.main import create_app
+from mocks.main import SENSITIVE_RE, MockState
 from mocks.main import create_app as create_mock_app
 
 MOCK_URL = "http://mock-engines"  # условный адрес: запросы перехватывает ASGI-транспорт
@@ -39,6 +42,32 @@ async def mock_http(mock_app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
         yield client
 
 
+def engines_stub(vlm: str | dict = "{}", mineru: dict | None = None, failing: str = "") -> httpx.AsyncClient:
+    """HTTP-клиент с простейшими движками — для сценариев, которых нет в моке.
+
+    vlm — ответ Qwen3-VL: строка либо словарь «название JSON Schema -> ответ» (None — запрос без схемы);
+    mineru — ответ MinerU; failing — часть пути движка, который отвечает ошибкой 500.
+    DLP маскирует то же, что и мок; остальные движки возвращают короткий текст.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if failing and failing in path:
+            return httpx.Response(500, text="engine crashed")
+        if path.endswith("/chat/completions"):
+            title = (json.loads(request.content).get("format") or {}).get("title")
+            answer = vlm.get(title, "{}") if isinstance(vlm, dict) else vlm
+            return httpx.Response(200, json={"choices": [{"message": {"content": answer}}]})
+        if path.endswith("/inspect"):
+            text, hits = SENSITIVE_RE.subn("[REDACTED]", json.loads(request.content)["text"])
+            return httpx.Response(200, json={"text": text, "masked": hits > 0})
+        if path.endswith("/mineru/extract") and mineru:
+            return httpx.Response(200, json=mineru)
+        return httpx.Response(200, json={"markdown": "Текст документа"})
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
 @pytest.fixture
 def settings() -> Settings:
     """Настройки оркестратора для тестов: движки — мок, ожидания и интервалы короткие."""
@@ -51,13 +80,19 @@ def settings() -> Settings:
         dlp_url=f"{MOCK_URL}/dlp",
         gpu_wait_timeout_s=20,
         idle_check_interval_s=0.05,
+        task_poll_interval_s=0.02,
     )
 
 
 @pytest.fixture
-async def redis() -> AsyncIterator[FakeAsyncRedis]:
-    """Redis в памяти процесса, чистый для каждого теста."""
-    client = FakeAsyncRedis()
+def redis_server() -> FakeServer:
+    """Сервер Redis в памяти процесса, чистый для каждого теста. connected=False имитирует его отказ."""
+    return FakeServer()
+
+
+@pytest.fixture
+async def redis(redis_server: FakeServer) -> AsyncIterator[FakeAsyncRedis]:
+    client = FakeAsyncRedis(server=redis_server)
     yield client
     await client.aclose()
 
@@ -74,6 +109,34 @@ def engines(mock_http: httpx.AsyncClient, settings: Settings) -> dict[str, GpuEn
 @pytest.fixture
 def gpu(redis: FakeAsyncRedis, engines: dict[str, GpuEngineClient], settings: Settings) -> GPUResourceManager:
     return GPUResourceManager(redis, engines, settings)
+
+
+@pytest.fixture
+def start_app(settings: Settings, redis: FakeAsyncRedis, mock_http: httpx.AsyncClient):
+    """Запуск оркестратора целиком: движки — мок, Redis — в памяти.
+
+    Пример: async with start_app(max_file_size_mb=1) as client: ...
+    Аргументы переопределяют настройки; http — другой HTTP-клиент для запросов к движкам.
+    """
+
+    @asynccontextmanager
+    async def start(http: httpx.AsyncClient | None = None, **overrides) -> AsyncIterator[httpx.AsyncClient]:
+        app = create_app(settings.model_copy(update=overrides), redis=redis, http=http or mock_http)
+        transport = httpx.ASGITransport(app=app)
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(transport=transport, base_url="http://doc-orchestrator") as client,
+        ):
+            yield client
+
+    return start
+
+
+@pytest.fixture
+async def client(start_app) -> AsyncIterator[httpx.AsyncClient]:
+    """HTTP-клиент работающего оркестратора с настройками по умолчанию."""
+    async with start_app() as http:
+        yield http
 
 
 def _sample(name: str) -> bytes:

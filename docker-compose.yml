@@ -4,6 +4,7 @@
 services:
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -12,6 +13,7 @@ services:
 
   mock-engines:
     build: ./mocks
+    restart: unless-stopped
     ports:
       - "8001:8001"
     healthcheck:
@@ -22,6 +24,7 @@ services:
 
   doc-orchestrator:
     build: .
+    restart: unless-stopped
     ports:
       - "8000:8000"
     # Файл .env необязателен: без него сервис работает с заглушками
