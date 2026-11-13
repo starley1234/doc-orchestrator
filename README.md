@@ -174,9 +174,10 @@ cp .env.example .env   # указать DOCLING_URL, MINERU_URL, PADDLE_URL, OLL
 docker compose -f docker-compose.prod.yml up -d --build   # redis и doc-orchestrator (:8000)
 ```
 
-Движок, опубликованный на порту самого сервера, из контейнера доступен как `host.docker.internal`,
-например `OLLAMA_URL=http://host.docker.internal:11434`. Модель задаётся в `VLM_MODEL`
-(по умолчанию `qwen3-vl:4b-instruct-q8_0`; нужен instruct-вариант, не thinking).
+Движок, запущенный на самом сервере, из контейнера доступен как `host.docker.internal`, например
+`OLLAMA_URL=http://host.docker.internal:11434` (Ollama при этом должен слушать не только `127.0.0.1`:
+`OLLAMA_HOST=0.0.0.0`). Модель задаётся в `VLM_MODEL` — по умолчанию `qwen3-vl:4b-instruct-q8_0`;
+нужен instruct-вариант, не thinking.
 
 От движков оркестратор ждёт такие HTTP-контракты (те же, что у `mock-engines`):
 

@@ -21,8 +21,6 @@ services:
     ports:
       - "8000:8000"
     env_file: .env
-    environment:
-      REDIS_URL: redis://redis:6379/0  # Redis этого же стенда
     extra_hosts:
       # Движок, запущенный на портах самого сервера, доступен из контейнера как host.docker.internal
       - "host.docker.internal:host-gateway"

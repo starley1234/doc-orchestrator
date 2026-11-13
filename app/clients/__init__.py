@@ -1,1 +1,1 @@
-"""HTTP-клиенты внешних движков: Docling, MinerU, PaddleOCR-VL, Qwen3-VL (Gateway), DLP."""
+"""HTTP-клиенты ML-движков: Docling, MinerU, PaddleOCR-VL и Qwen3-VL (Ollama)."""
