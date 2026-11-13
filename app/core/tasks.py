@@ -88,7 +88,7 @@ class TaskQueue:
         if state is None or file_bytes is None:  # срок хранения истёк либо задачу уже выполнили
             return
         task = StructuredResult.model_validate_json(state)
-        await self._save(task.model_copy(update={"status": TaskStatus.PROCESSING}))
+        await self._save(task_id, task.model_copy(update={"status": TaskStatus.PROCESSING}))
         try:
             result = await self._handler(file_bytes, filename.decode(), task.doc_type)
             result = result.model_copy(update={"task_id": task_id})
@@ -99,10 +99,10 @@ class TaskQueue:
             result = task.model_copy(
                 update={"status": TaskStatus.FAILED, "error": "Внутренняя ошибка сервиса"}
             )
-        await self._save(result, finished=True)
+        await self._save(task_id, result, finished=True)
 
-    async def _save(self, state: StructuredResult, finished: bool = False) -> None:
-        key = _key(state.task_id)
+    async def _save(self, task_id: str, state: StructuredResult, finished: bool = False) -> None:
+        key = _key(task_id)
         async with self._redis.pipeline(transaction=True) as pipe:
             pipe.hset(key, "state", state.model_dump_json())
             if finished:

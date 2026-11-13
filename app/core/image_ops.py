@@ -74,7 +74,7 @@ def crop_drawing_zones(img_bytes: bytes, max_pixels: int = DEFAULT_MAX_PIXELS) -
 def _open_image(img_bytes: bytes) -> Image.Image:
     """Открывает изображение. Атрибут .format сохраняется, только если пиксели не менялись."""
     try:
-        image = Image.open(io.BytesIO(img_bytes))
+        image: Image.Image = Image.open(io.BytesIO(img_bytes))
         image.load()
     except (OSError, ValueError, Image.DecompressionBombError) as exc:
         raise InvalidFileError(f"Не удалось прочитать изображение: {exc}") from exc

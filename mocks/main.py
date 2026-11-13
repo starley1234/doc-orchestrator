@@ -268,7 +268,7 @@ def _vlm_answer(schema: dict[str, Any] | None, prompt: str) -> str:
         "DrawingStampSchema": STAMP,
         "TechRequirementsSchema": TECH_REQUIREMENTS,
     }
-    return json.dumps(answers.get(schema.get("title"), {}), ensure_ascii=False)
+    return json.dumps(answers.get(schema.get("title", ""), {}), ensure_ascii=False)
 
 
 @router.post("/gateway/v1/chat/completions")

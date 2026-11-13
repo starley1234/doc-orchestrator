@@ -11,14 +11,7 @@ from app.core.classifier import RouteType, classify_file
 from app.core.errors import UnsupportedFileError
 from app.core.image_ops import crop_drawing_zones, first_page_image
 from app.pipelines.base import Engines
-from app.schemas.common import (
-    Counterparty,
-    DocType,
-    StructuredResult,
-    TaskStatus,
-    TradeDocument,
-    ValidationResult,
-)
+from app.schemas.common import Counterparty, DocType, StructuredResult, TaskStatus, ValidationResult
 from app.schemas.contract import ContractSchema
 from app.schemas.drawing_stamp import DrawingStampSchema, TechRequirementsSchema
 from app.schemas.invoice import InvoiceSchema
@@ -144,14 +137,14 @@ class StructuredPipeline:
 def _validate(document: BaseModel) -> list[str]:
     """Пост-валидация документа: реквизиты сторон, БИК и сходимость сумм."""
     warnings: list[str] = []
-    if isinstance(document, TradeDocument):  # УПД и счёт на оплату
+    if isinstance(document, UpdSchema | InvoiceSchema):
         warnings += _check_party(document.seller, "продавца") + _check_party(document.buyer, "покупателя")
     if isinstance(document, ContractSchema):
         for number, party in enumerate(document.parties, start=1):
             warnings += _check_party(party, f"стороны {number}")
     if isinstance(document, InvoiceSchema) and not validate_bik(document.bank.bik):
         warnings.append(f"БИК банка {document.bank.bik} имеет неверный формат")
-    if isinstance(document, TradeDocument):
+    if isinstance(document, UpdSchema | InvoiceSchema):
         warnings += validate_invoice_math(document)
     return warnings
 

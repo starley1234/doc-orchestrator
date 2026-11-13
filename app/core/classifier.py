@@ -16,19 +16,7 @@ MIN_TEXT_CHARS_PER_PAGE = 100  # меньше символов текста в �
 SCAN_IMAGE_COVERAGE = 0.5  # картинка на половину страницы и больше — страница отсканирована
 
 # Начала слов в имени файла, по которым скан считается сложной таблицей или формой
-TABLE_KEYWORDS = (
-    "упд",
-    "upd",
-    "счет",
-    "счёт",
-    "invoice",
-    "накладн",
-    "табл",
-    "table",
-    "бланк",
-    "анкет",
-    "form",
-)
+TABLE_HINTS = ("упд", "upd", "счет", "счёт", "invoice", "накладн", "табл", "table", "бланк", "анкет", "form")
 
 
 class RouteType(StrEnum):
@@ -58,13 +46,13 @@ def classify_file(file_bytes: bytes, filename: str, doc_type_hint: str | None = 
 def is_table_document(filename: str) -> bool:
     """Помечен ли документ как сложная таблица или форма: такие сканы распознаёт PaddleOCR-VL."""
     words = re.split(r"[\W_]+", PurePath(filename).stem.lower())
-    return any(word.startswith(TABLE_KEYWORDS) for word in words)
+    return any(word.startswith(TABLE_HINTS) for word in words)
 
 
 def _classify_pdf(file_bytes: bytes, doc_type_hint: str | None) -> RouteType:
     """Цифровой PDF или скан: смотрим на текстовый слой и на страницы-картинки."""
     with open_pdf(file_bytes) as doc:
-        text_chars = sum(len(page.get_text().strip()) for page in doc)
+        text_chars = sum(len(page.get_text().strip()) for page in doc.pages())
         has_text_layer = text_chars / doc.page_count >= MIN_TEXT_CHARS_PER_PAGE
         # В УПД и счетах со сканами текстовому слою не доверяем (это OCR-подложка): распознаём заново
         distrust_text = doc_type_hint in ("upd", "invoice") and _has_scanned_pages(doc)
@@ -73,7 +61,7 @@ def _classify_pdf(file_bytes: bytes, doc_type_hint: str | None) -> RouteType:
 
 def _has_scanned_pages(doc: pymupdf.Document) -> bool:
     """Есть ли в PDF отсканированные страницы: картинка занимает большую часть листа."""
-    for page in doc:
+    for page in doc.pages():
         min_area = SCAN_IMAGE_COVERAGE * page.rect.get_area()
         for image in page.get_image_info():
             if (pymupdf.Rect(image["bbox"]) & page.rect).get_area() >= min_area:
