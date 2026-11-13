@@ -27,7 +27,7 @@ docker compose up --build -d       # redis, mock-engines (:8001), doc-orchestrat
 curl http://localhost:8000/health  # {"status":"ok"}
 ```
 
-Нужен Docker Compose 2.24 или новее. Описание API — <http://localhost:8000/docs>. Что загружено
+Настраивать ничего не нужно. Описание API — <http://localhost:8000/docs>. Что загружено
 в «видеопамять» мока и нарушались ли лимиты GPU — `curl http://localhost:8001/mock/state`.
 
 ## Примеры запросов
@@ -165,9 +165,9 @@ curl http://localhost:8000/api/tasks/a9131301-…
 
 ## Боевой сервер
 
-Все параметры задаются переменными окружения или файлом `.env`: образец — `.env.example`, значения
-по умолчанию — `app/config.py`. Адресов в коде нет: для перехода на настоящие движки достаточно
-указать их URL и запустить стенд без заглушки:
+Все параметры задаются переменными окружения, на боевом сервере — файлом `.env`: образец —
+`.env.example`, значения по умолчанию — `app/config.py`. Адресов в коде нет: для перехода на настоящие
+движки достаточно указать их URL и запустить стенд без заглушки:
 
 ```bash
 cp .env.example .env   # указать DOCLING_URL, MINERU_URL, PADDLE_URL, OLLAMA_URL и при необходимости API_KEY

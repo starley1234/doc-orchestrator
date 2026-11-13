@@ -1,4 +1,5 @@
-# Тестовый стенд: оркестратор + Redis + заглушка ML-движков.
+# Тестовый стенд: оркестратор + Redis + заглушка ML-движков. Настраивать ничего не нужно:
+# по умолчанию сервис обращается к redis и mock-engines этого стенда (см. app/config.py).
 # Для боевого сервера с настоящими движками есть docker-compose.prod.yml.
 
 services:
@@ -28,10 +29,6 @@ services:
     restart: unless-stopped
     ports:
       - "8000:8000"
-    # Файл .env необязателен: по умолчанию сервис настроен на redis и mock-engines этого стенда
-    env_file:
-      - path: .env
-        required: false
     depends_on:
       redis:
         condition: service_healthy
