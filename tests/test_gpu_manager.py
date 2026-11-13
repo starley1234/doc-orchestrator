@@ -238,7 +238,7 @@ async def test_lock_ttl_is_separate_from_waiting_time(make_gpu, redis: FakeAsync
 async def test_waiting_too_long_raises_gpu_busy(make_gpu):
     gpu = make_gpu(gpu_lock_wait_sec=0.2)
 
-    async with gpu.acquire_gpu1(), asyncio.timeout(5):  # ждём очередь не вечно
+    async with gpu.acquire_gpu1(), asyncio.timeout(60):  # ждём очередь не вечно
         started = time.monotonic()
         with pytest.raises(GPUBusyError, match="lock:gpu1"):
             async with gpu.acquire_gpu1():

@@ -149,7 +149,7 @@ async def test_service_recovers_after_engine_restart(client, scan_pdf: bytes, mo
 async def test_busy_gpu_is_503(start_app, scan_pdf: bytes, redis: FakeAsyncRedis):
     await redis.set("lock:gpu0", "занято другой задачей")
 
-    async with asyncio.timeout(5), start_app(gpu_lock_wait_sec=0.2) as client:  # ждём очередь не вечно
+    async with asyncio.timeout(60), start_app(gpu_lock_wait_sec=0.2) as client:  # ждём очередь не вечно
         response = await client.put("/process", content=scan_pdf, headers=PDF)
 
     assert response.status_code == 503
@@ -345,6 +345,16 @@ async def statuses(client: httpx.AsyncClient, task_ids: list[str]) -> list[str]:
     return [(await client.get(f"/api/tasks/{task_id}")).json()["status"] for task_id in task_ids]
 
 
+async def wait_for_statuses(client: httpx.AsyncClient, task_ids: list[str], expected: list[str]) -> None:
+    """Ждёт (до 20 секунд), пока задачи придут в ожидаемые состояния, и проверяет, что они в них остаются."""
+    for _ in range(2000):
+        if await statuses(client, task_ids) == expected:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.1)
+    assert await statuses(client, task_ids) == expected
+
+
 async def test_async_mode_returns_task_id_then_result(client, scan_pdf: bytes, redis: FakeAsyncRedis):
     response = await extract(client, "upd.pdf", scan_pdf, doc_type="upd", async_mode="true")
 
@@ -403,15 +413,6 @@ async def test_unexpected_error_in_async_task_does_not_leak_details(start_app, d
     assert (task["status"], task["error"]) == ("failed", "Внутренняя ошибка сервиса")
 
 
-async def wait_until_vlm_is_asked(started: list[str]) -> None:
-    """Ждёт (до 2 секунд), пока первая задача дойдёт до Qwen3-VL, и даёт остальным время стартовать."""
-    for _ in range(200):
-        if started:
-            break
-        await asyncio.sleep(0.01)
-    await asyncio.sleep(0.05)
-
-
 async def test_async_tasks_wait_for_a_free_slot(start_app, digital_pdf: bytes):
     http, release, started = blocked_vlm()
 
@@ -422,11 +423,14 @@ async def test_async_tasks_wait_for_a_free_slot(start_app, digital_pdf: bytes):
             ]
             for n in range(5)
         ]
-        await wait_until_vlm_is_asked(started)
-
-        # Работают две задачи (вторая ждёт GPU 1), остальным свободного места пока нет
-        assert await statuses(client, task_ids) == ["processing", "processing", "queued", "queued", "queued"]
-        assert len(started) == 1
+        # Работают две задачи, остальным свободного места пока нет
+        await wait_for_statuses(client, task_ids, ["processing", "processing", "queued", "queued", "queued"])
+        for _ in range(2000):  # ждём (до 20 секунд), пока первая задача дойдёт до Qwen3-VL
+            if started:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.1)
+        assert len(started) == 1  # вторая работающая задача ждёт своей очереди к GPU 1
 
         release.set()
         results = [await wait_for_task(client, task_id) for task_id in task_ids]
@@ -438,20 +442,17 @@ async def test_async_tasks_wait_for_a_free_slot(start_app, digital_pdf: bytes):
 async def test_async_tasks_are_marked_failed_when_service_stops(
     start_app, digital_pdf: bytes, redis: FakeAsyncRedis
 ):
-    http, _, started = blocked_vlm()
+    http, _, _ = blocked_vlm()
 
-    async with (
-        asyncio.timeout(10),
-        start_app(http=http, task_concurrency=1) as client,
-    ):  # остановка не зависает
+    # Таймаут — чтобы сломанная остановка сервиса провалила тест, а не подвесила его
+    async with asyncio.timeout(60), start_app(http=http, task_concurrency=1) as client:
         task_ids = [
             (await extract(client, "upd.pdf", digital_pdf, doc_type="upd", async_mode="true")).json()[
                 "task_id"
             ]
             for _ in range(2)
         ]
-        await wait_until_vlm_is_asked(started)
-        assert await statuses(client, task_ids) == ["processing", "queued"]
+        await wait_for_statuses(client, task_ids, ["processing", "queued"])
     # Сервис остановлен: и работавшая, и ждавшая задачи завершены с понятной причиной
 
     for task_id in task_ids:

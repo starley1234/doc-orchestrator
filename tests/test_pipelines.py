@@ -483,6 +483,7 @@ async def test_without_gpu_queue_same_requests_break_the_limits(
     monkeypatch.setattr(
         GPUResourceManager, "_exclusive", lambda self, name, blocking=True: asyncio.timeout(None)
     )
+    mock.delay_scale = 10  # «движки» работают по 1,5 секунды: запросы заведомо пересекаются на любой машине
 
     responses = await asyncio.gather(*six_requests(client, scan_pdf, drawing_a1))
 
