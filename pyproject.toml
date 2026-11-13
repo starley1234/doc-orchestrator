@@ -2,6 +2,7 @@
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"  # async-тесты и фикстуры работают без декораторов
+asyncio_default_fixture_loop_scope = "function"  # свой event loop на каждый тест
 pythonpath = ["."]     # пакеты app и mocks импортируются от корня репозитория
 testpaths = ["tests"]
 
