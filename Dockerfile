@@ -9,7 +9,10 @@ WORKDIR /srv
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# app — сам оркестратор; gateway — шлюз движков для боевого сервера (docker-compose.prod.yml):
+# тот же образ, другая команда запуска
 COPY app ./app
+COPY gateway ./gateway
 
 # Сервису не нужны права root
 USER nobody

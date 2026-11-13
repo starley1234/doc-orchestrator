@@ -2,4 +2,5 @@
 *
 !requirements.txt
 !app/
+!gateway/
 **/__pycache__
