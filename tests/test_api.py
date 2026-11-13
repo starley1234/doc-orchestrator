@@ -14,6 +14,7 @@ from conftest import engines_stub
 from fakeredis import FakeAsyncRedis, FakeServer
 
 from app.config import Settings
+from app.main import create_app
 from mocks.main import DOCUMENT, MockState
 
 ROOT = Path(__file__).parent.parent  # корень репозитория
@@ -148,7 +149,7 @@ async def test_service_recovers_after_engine_restart(client, scan_pdf: bytes, mo
 async def test_busy_gpu_is_503(start_app, scan_pdf: bytes, redis: FakeAsyncRedis):
     await redis.set("lock:gpu0", "занято другой задачей")
 
-    async with start_app(gpu_lock_wait_sec=0.2) as client:
+    async with asyncio.timeout(5), start_app(gpu_lock_wait_sec=0.2) as client:  # ждём очередь не вечно
         response = await client.put("/process", content=scan_pdf, headers=PDF)
 
     assert response.status_code == 503
@@ -177,6 +178,13 @@ async def test_unknown_doc_type_is_422(client, scan_pdf: bytes, doc_type: str):
 async def test_missing_form_fields_are_422(client, scan_pdf: bytes):
     assert (await client.post("/api/extract-structured", data={"doc_type": "upd"})).status_code == 422
     assert (await extract(client, "upd.pdf", scan_pdf)).status_code == 422
+
+
+@pytest.mark.parametrize("sent_name", ["../../etc/upd.pdf", "C:\\Документы\\upd.pdf"])
+async def test_uploaded_filename_path_is_dropped(client, digital_pdf: bytes, mock: MockState, sent_name: str):
+    await extract(client, sent_name, digital_pdf, doc_type="upd")
+
+    assert "Извлеки данные документа «upd.pdf»" in mock.prompts[0]
 
 
 async def test_binary_file_of_unknown_format_is_415(client):
@@ -423,7 +431,8 @@ async def test_async_tasks_wait_for_a_free_slot(start_app, digital_pdf: bytes):
         release.set()
         results = [await wait_for_task(client, task_id) for task_id in task_ids]
         assert [task["status"] for task in results] == ["completed"] * 5
-        assert client._transport.app.state.background_tasks == set()  # завершённые задачи не копятся в памяти
+        await asyncio.sleep(0.05)  # даём циклу событий убрать завершённые задачи
+        assert client._transport.app.state.background_tasks == set()  # в памяти они не копятся
 
 
 async def test_async_tasks_are_marked_failed_when_service_stops(
@@ -508,6 +517,33 @@ def test_service_starts_with_settings_from_environment():
     result = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True)
 
     assert result.stdout.strip() == "http://paddle.prod s3cret", result.stderr
+
+
+async def test_own_connections_are_configured_from_settings(settings: Settings):
+    # Без готовых клиентов (как в бою) сервис сам открывает подключения к Redis и движкам и сам их закрывает
+    custom = {
+        "redis_url": "redis://redis.test:6380/5",
+        "http_timeout_sec": 123,
+        "gpu0_check_interval_sec": 60,
+    }
+    app = create_app(settings.model_copy(update=custom))
+
+    async with app.router.lifespan_context(app):
+        redis_options = app.state.redis.connection_pool.connection_kwargs
+        http = app.state.markdown_pipeline._engines.docling._http
+        assert (redis_options["host"], redis_options["port"], redis_options["db"]) == ("redis.test", 6380, 5)
+        assert http.timeout == httpx.Timeout(123)
+
+    assert http.is_closed
+
+
+async def test_background_watcher_stops_with_the_service(start_app):
+    def watchers() -> list[asyncio.Task]:
+        return [task for task in asyncio.all_tasks() if task.get_name() == "gpu0-idle-watcher"]
+
+    async with start_app():
+        assert len(watchers()) == 1
+    assert watchers() == []
 
 
 async def test_openapi_describes_all_endpoints(client):
