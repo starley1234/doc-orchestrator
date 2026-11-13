@@ -29,7 +29,7 @@ class Settings(BaseSettings):
 
     # --- Таймауты, секунды ---
     http_timeout_s: PositiveFloat = 120  # один HTTP-запрос к движку
-    gpu_lock_timeout_s: PositiveFloat = 300  # TTL лока GPU: дольше задача видеокарту не держит
+    gpu_lock_timeout_s: PositiveFloat = 300  # TTL лока GPU: страховка на случай падения процесса
     gpu_wait_timeout_s: PositiveFloat = 600  # сколько задача ждёт своей очереди к GPU
     paddle_idle_ttl_s: PositiveFloat = 120  # простой paddle, после которого GPU 0 возвращается mineru
     idle_check_interval_s: PositiveFloat = 30  # период фоновой проверки простоя

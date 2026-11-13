@@ -4,10 +4,13 @@
 """
 
 import asyncio
+import base64
+import io
 import json
 
 import httpx
 import pytest
+from PIL import Image
 
 from mocks.main import MockState
 
@@ -77,6 +80,26 @@ async def test_gateway_rejects_parallel_requests(mock_http: httpx.AsyncClient, m
     assert sorted(r.status_code for r in responses) == [200, 429, 429]
     assert "Too Many Concurrent Requests on GPU 1" in next(r.text for r in responses if r.status_code == 429)
     assert mock.gateway_rejects == 2
+
+
+def with_image(body: dict, width: int, height: int) -> dict:
+    """Добавляет в запрос PNG-картинку заданного размера."""
+    buffer = io.BytesIO()
+    Image.new("L", (width, height)).save(buffer, "PNG")
+    url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    body["messages"][0]["content"].append({"type": "image_url", "image_url": {"url": url}})
+    return body
+
+
+async def test_gateway_oom_on_oversized_image(mock_http: httpx.AsyncClient, mock: MockState):
+    fits = await mock_http.post(CHAT_URL, json=with_image(chat("Опиши схему"), 1280, 1000))
+    too_big = await mock_http.post(CHAT_URL, json=with_image(chat("Опиши схему"), 1281, 1000))
+
+    assert fits.status_code == 200
+    assert too_big.status_code == 500
+    assert too_big.json()["detail"] == "Out Of Memory (Simulated)"
+    assert mock.images == [(1280, 1000), (1281, 1000)]
+    assert mock.oom_errors == 1
 
 
 async def test_gateway_describes_image_with_mermaid(mock_http: httpx.AsyncClient):

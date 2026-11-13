@@ -3,7 +3,8 @@
 Имитирует по HTTP Docling, MinerU, PaddleOCR-VL, Gateway с Qwen3-VL и Regex-DLP.
 Кроме ответов воспроизводит ограничения железа, чтобы тесты ловили ошибки оркестратора:
   * GPU 0: вторая модель в VRAM -> HTTP 500 Out Of Memory (Simulated);
-  * GPU 1: второй одновременный запрос -> HTTP 429.
+  * GPU 1: второй одновременный запрос -> HTTP 429;
+  * GPU 1: картинка крупнее 1 280 000 пикселей -> HTTP 500 Out Of Memory (Simulated).
 
 Особые имена файлов меняют ответы:
   * «bad_inn» — УПД с неверным ИНН продавца и несходящимся итогом;
@@ -11,9 +12,12 @@
 """
 
 import asyncio
+import base64
 import json
 import re
+import struct
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal
 from uuid import uuid4
@@ -113,6 +117,7 @@ TECH_REQUIREMENTS = {
 }
 
 MERMAID = "```mermaid\ngraph TD; A-->B;\n```"
+VLM_MAX_PIXELS = 1_280_000  # картинка крупнее не помещается в 8 ГБ VRAM GPU 1
 PASSPORT = "4510 123456"  # тестовый номер паспорта
 SECRET_TEXT = f"\n\nКлюч доступа: SECRET_TOKEN. Паспорт: {PASSPORT}."
 PNG_1X1 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR42mP4//8/AAX+Av4zEpUUAAAAAElFTkSuQmCC"
@@ -153,12 +158,13 @@ class MockState:
     delay_s: float = 0.1  # имитация времени работы движка
     loaded: set[str] = field(default_factory=set)  # модели в VRAM GPU 0
     gateway_lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # GPU 1: один запрос за раз
-    oom_errors: int = 0  # сколько раз сымитирован OOM на GPU 0
+    oom_errors: int = 0  # сколько раз сымитирован OOM (GPU 0 или GPU 1)
     gateway_rejects: int = 0  # сколько раз сымитирован 429 на GPU 1
     gpu0_jobs: int = 0  # задач на GPU 0 прямо сейчас
     gpu0_peak: int = 0  # максимум одновременных задач на GPU 0
     calls: list[str] = field(default_factory=list)  # журнал вызовов движков GPU 0
     prompts: list[str] = field(default_factory=list)  # промпты, дошедшие до Qwen3-VL
+    images: list[tuple[int, int]] = field(default_factory=list)  # размеры картинок, дошедших до Qwen3-VL
 
 
 def get_state(request: Request) -> MockState:
@@ -235,16 +241,17 @@ async def extract(model: Gpu0Model, file: UploadFile, state: StateDep) -> dict[s
 # --- Gateway + Qwen3-VL (GPU 1) -----------------------------------------------------------
 
 
-def _prompt_text(body: dict[str, Any]) -> str:
-    """Текст промпта из сообщений (content — строка или список частей, как в OpenAI API)."""
-    parts: list[str] = []
+def _parts(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    """Части всех сообщений. Поле content — строка или список частей, как в OpenAI API."""
     for message in body.get("messages", []):
         content = message.get("content", "")
-        if isinstance(content, str):
-            parts.append(content)
-        else:
-            parts += [part.get("text", "") for part in content if part.get("type") == "text"]
-    return "\n".join(parts)
+        yield from [{"type": "text", "text": content}] if isinstance(content, str) else content
+
+
+def _png_size(data_url: str) -> tuple[int, int]:
+    """Ширина и высота PNG из data URL: они записаны в заголовке IHDR. Не PNG — (0, 0)."""
+    raw = base64.b64decode(data_url.partition(",")[2])
+    return struct.unpack(">II", raw[16:24]) if raw[:8] == b"\x89PNG\r\n\x1a\n" else (0, 0)
 
 
 def _vlm_answer(schema: dict[str, Any] | None, prompt: str) -> str:
@@ -271,8 +278,14 @@ async def chat_completions(body: dict[str, Any], state: StateDep) -> dict[str, A
         state.gateway_rejects += 1
         raise HTTPException(429, "Too Many Concurrent Requests on GPU 1")
     async with state.gateway_lock:
-        prompt = _prompt_text(body)
+        parts = list(_parts(body))
+        prompt = "\n".join(part.get("text", "") for part in parts if part.get("type") == "text")
+        images = [_png_size(part["image_url"]["url"]) for part in parts if part.get("type") == "image_url"]
         state.prompts.append(prompt)
+        state.images += images
+        if any(width * height > VLM_MAX_PIXELS for width, height in images):
+            state.oom_errors += 1
+            raise HTTPException(500, "Out Of Memory (Simulated)")
         await asyncio.sleep(state.delay_s)
         answer = _vlm_answer(body.get("format"), prompt)
     return {

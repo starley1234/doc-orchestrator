@@ -8,6 +8,7 @@ from make_samples import make_pdf
 from PIL import ExifTags, Image
 
 from app.core import image_ops
+from app.core.aio import run_cpu
 from app.core.errors import InvalidFileError
 from app.core.image_ops import (
     crop_drawing_zones,
@@ -15,7 +16,6 @@ from app.core.image_ops import (
     is_pdf,
     render_pdf_to_images,
     resize_max_pixels,
-    run_cpu,
 )
 
 

@@ -1,13 +1,9 @@
 """Препроцессинг изображений: рендер PDF в PNG, ограничение по числу пикселей, кропы зон чертежа."""
 
-import asyncio
 import io
 import math
-from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Iterator
 from contextlib import contextmanager
-from functools import partial
-from typing import Any
 
 import pymupdf  # PyMuPDF; прежнее имя модуля — fitz (устарело)
 from PIL import ExifTags, Image, ImageOps
@@ -20,14 +16,6 @@ MAX_RENDER_PIXELS = 40_000_000  # потолок растра страницы: 
 # Зоны чертежа ЕСКД в долях листа: (x0, y0, x1, y1)
 STAMP_ZONE = (0.55, 0.75, 1.00, 1.00)  # основная надпись — правый нижний угол
 TECH_REQ_ZONE = (0.55, 0.35, 1.00, 0.78)  # технические требования — над штампом
-
-# PyMuPDF не потокобезопасен, поэтому вся тяжёлая работа с документами идёт через один поток
-_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="doc-cpu")
-
-
-async def run_cpu(func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
-    """Выполняет блокирующую функцию в выделенном потоке, не останавливая event loop."""
-    return await asyncio.get_running_loop().run_in_executor(_executor, partial(func, *args, **kwargs))
 
 
 def is_pdf(data: bytes) -> bool:
