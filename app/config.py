@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     openwebui_api_token: str | None = None
 
     # --- Таймауты, секунды ---
-    http_timeout_s: PositiveFloat = 120  # один HTTP-запрос к движку
+    http_timeout_s: PositiveFloat = 300  # один HTTP-запрос к движку (OCR большого скана идёт минуты)
     gpu_lock_timeout_s: PositiveFloat = 300  # TTL лока GPU: страховка на случай падения процесса
     gpu_wait_timeout_s: PositiveFloat = 600  # сколько задача ждёт своей очереди к GPU
     paddle_idle_ttl_s: PositiveFloat = 120  # простой paddle, после которого GPU 0 возвращается mineru

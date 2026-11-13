@@ -15,7 +15,7 @@ from make_samples import make_pdf
 from PIL import Image
 
 from app.core.gpu_manager import GPUResourceManager
-from mocks.main import MERMAID, PNG_1X1, STAMP, TECH_REQUIREMENTS, UPD, VLM_MAX_PIXELS, MockState, create_app
+from mocks.main import MERMAID, PNG_1X1, STAMP, TECH_REQUIREMENTS, UPD, VLM_MAX_PIXELS, MockState
 
 DESCRIBE_PROMPT = "Опиши схему текстом или переведи блок-схему в синтаксис Mermaid"
 PASSPORT = "4510 123456"
@@ -387,29 +387,15 @@ async def test_thirty_concurrent_requests(client, scan_pdf: bytes, drawing_png: 
     assert len(mock.prompts) == 30
 
 
-async def test_two_service_instances_share_the_gpus(settings, scan_pdf: bytes, drawing_png: bytes):
-    # Два экземпляра оркестратора работают с общими Redis и движками: очередь к GPU — общая
-    from fakeredis import FakeAsyncRedis, FakeServer
-
-    from app.main import create_app as create_orchestrator
-
-    mock_app = create_app(delay_s=0.02)
-    mock = mock_app.state.mock
-    server = FakeServer()
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=mock_app)) as engines_http:
-        apps = [
-            create_orchestrator(settings, redis=FakeAsyncRedis(server=server), http=engines_http)
-            for _ in range(2)
+async def test_two_service_instances_share_the_gpus(
+    start_app, scan_pdf: bytes, drawing_png: bytes, mock: MockState
+):
+    # Два экземпляра оркестратора с общими Redis и движками: очередь к видеокартам у них одна на двоих
+    async with start_app() as first, start_app() as second:
+        requests = [
+            request for client in (first, second) for request in mixed_requests(client, scan_pdf, drawing_png)
         ]
-        async with apps[0].router.lifespan_context(apps[0]), apps[1].router.lifespan_context(apps[1]):
-            clients = [
-                httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://doc-orchestrator")
-                for app in apps
-            ]
-            requests = [
-                request for client in clients for request in mixed_requests(client, scan_pdf, drawing_png)
-            ]
-            responses = await asyncio.gather(*requests)
+        responses = await asyncio.gather(*requests)
 
     assert [response.status_code for response in responses] == [200] * 10
     assert (mock.oom_errors, mock.gateway_rejects, mock.gpu0_peak) == (0, 0, 1)

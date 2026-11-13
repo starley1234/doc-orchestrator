@@ -20,10 +20,8 @@ class MarkdownPipeline:
         engines = self._engines
         route = await run_cpu(classify_file, file_bytes, filename, None)
         if route in (RouteType.DIGITAL_OFFICE, RouteType.DIGITAL_PDF):
-            markdown, engine_used = (
-                await engines.docling.convert(file_bytes, filename),
-                "docling",
-            )  # CPU, без GPU
+            # Цифровой документ читает Docling: он работает на CPU, очередь к GPU не нужна
+            markdown, engine_used = await engines.docling.convert(file_bytes, filename), "docling"
         elif is_table_document(filename):
             markdown, engine_used = await engines.paddle_ocr(file_bytes, filename), "paddle"
         else:

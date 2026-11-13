@@ -48,12 +48,16 @@ def test_text_threshold_is_100_chars_per_page():
     assert classify_file(make_pdf([CHARS_99]), "doc.pdf", None) is RouteType.SCAN_PDF
 
 
-def test_text_threshold_is_average_over_pages():
-    assert (
-        classify_file(make_pdf([CHARS_100 * 2, ""]), "doc.pdf", None) is RouteType.DIGITAL_PDF
-    )  # (201 + 0) / 2
-    assert classify_file(make_pdf([CHARS_100, CHARS_99]), "doc.pdf", None) is RouteType.SCAN_PDF  # 99.5
-    assert classify_file(make_pdf([CHARS_100, "", ""]), "doc.pdf", None) is RouteType.SCAN_PDF  # 33.3
+@pytest.mark.parametrize(
+    ("pages", "expected"),
+    [
+        ([CHARS_100 * 2, ""], RouteType.DIGITAL_PDF),  # (201 + 0) / 2 = 100.5 символа на страницу
+        ([CHARS_100, CHARS_99], RouteType.SCAN_PDF),  # 99.5
+        ([CHARS_100, "", ""], RouteType.SCAN_PDF),  # 33.3
+    ],
+)
+def test_text_threshold_is_average_over_pages(pages: list[str], expected: RouteType):
+    assert classify_file(make_pdf(pages), "doc.pdf", None) is expected
 
 
 @pytest.mark.parametrize(

@@ -2,6 +2,10 @@
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 from urllib.parse import quote
 
 import httpx
@@ -9,8 +13,10 @@ import pytest
 from conftest import MOCK_URL, engines_stub
 from fakeredis import FakeAsyncRedis, FakeServer
 
+from app.config import Settings
 from mocks.main import INVOICE, UPD, MockState
 
+ROOT = Path(__file__).parent.parent  # корень репозитория
 PDF = {"X-Filename": "scan.pdf"}
 
 
@@ -355,7 +361,24 @@ async def test_malformed_task_id_is_422(client):
     assert (await client.get("/api/tasks/not-a-uuid")).status_code == 422
 
 
-# --- Служебное ------------------------------------------------------------------------------
+# --- Настройки и служебное --------------------------------------------------------------------
+
+
+def test_env_example_lists_every_setting():
+    lines = (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+    names = {line.partition("=")[0].lower() for line in lines if line and not line.startswith("#")}
+
+    assert names == set(Settings.model_fields)
+    Settings(_env_file=ROOT / ".env.example")  # все значения образца проходят проверку типов
+
+
+def test_service_starts_with_settings_from_environment():
+    # Так сервис запускает uvicorn: импорт app.main собирает приложение из переменных окружения
+    env = {**os.environ, "LOG_LEVEL": "debug", "PADDLE_URL": "http://paddle.prod"}
+    code = "from app.main import app; print(app.state.settings.paddle_url)"
+    result = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True)
+
+    assert result.stdout.strip() == "http://paddle.prod", result.stderr
 
 
 async def test_openapi_describes_all_endpoints(client):

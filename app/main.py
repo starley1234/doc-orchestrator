@@ -26,7 +26,8 @@ def create_app(
 ) -> FastAPI:
     """Собирает приложение. Готовые клиенты Redis и HTTP можно передать снаружи (так делают тесты)."""
     settings = settings or get_settings()
-    logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    log_level = settings.log_level.upper()  # logging понимает только «DEBUG», а не «debug»
+    logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)  # иначе в лог попадает каждый запрос к движкам
 
     @asynccontextmanager
