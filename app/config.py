@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     docling_url: str = "http://mock-engines:8001/docling"
     mineru_url: str = "http://mock-engines:8001/mineru"
     paddle_url: str = "http://mock-engines:8001/paddle"
-    ollama_url: str = "http://mock-engines:8001"  # боевой Ollama: http://ollama:11434
+    ollama_url: str = "http://mock-engines:8001"  # боевой Ollama: http://ollama-vlm:11434
     vlm_model: str = "qwen3-vl:4b-instruct-q8_0"  # строго instruct-вариант, не thinking
     vlm_num_ctx: PositiveInt = 8192  # окно контекста модели, токенов
 

@@ -1,34 +1,56 @@
-# Боевой сервер: оркестратор + Redis. ML-движки (docling-serve, mineru, paddle, ollama)
-# разворачиваются отдельно, их адреса задаются в файле .env (образец — .env.example).
+# Боевой сервер: doc-orchestrator и шлюз движков рядом со стеком из «ИНСТРУКЦИЯ_ПО_УСТАНОВКЕ_OCR.md».
+# Redis и сами движки (Docling, MinerU, PaddleOCR-VL, Ollama) запускает /opt/ai-doc-stack/docker-compose.yml;
+# все контейнеры видят друг друга по именам в общей сети doc-net.
 #
-#   cp .env.example .env    # и указать адреса движков
+#   sudo bash deploy/install.sh orchestrator   # создаст .env с адресами и ключом и запустит
+#
+# Вручную: cp .env.example .env, указать адреса из раздела «Боевой сервер» README.md, затем
 #   docker compose -f docker-compose.prod.yml up -d --build
 
 services:
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
   doc-orchestrator:
     build: .
     image: doc-orchestrator
+    container_name: doc-orchestrator
     restart: unless-stopped
     ports:
       - "8000:8000"
     env_file: .env
-    extra_hosts:
-      # Движок, запущенный на портах самого сервера, доступен из контейнера как host.docker.internal
-      - "host.docker.internal:host-gateway"
     depends_on:
-      redis:
+      engine-gateway:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request as r; r.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
       interval: 5s
       timeout: 3s
       retries: 10
+    networks:
+      - doc-net
+
+  # Шлюз движков: переводит запросы оркестратора в API docling-serve, MinerU и PaddleOCR-VL,
+  # а команды load/unload — в запуск и остановку контейнеров mineru-api и paddle-gpu0.
+  # Наружу порт не публикуется: шлюз нужен только оркестратору.
+  engine-gateway:
+    image: doc-orchestrator                 # тот же образ (его собирает сервис выше), другая команда
+    pull_policy: never                      # образ только локальный: не искать его в реестрах
+    container_name: engine-gateway
+    restart: unless-stopped
+    command: ["uvicorn", "gateway.main:app", "--host", "0.0.0.0", "--port", "8001"]
+    env_file: .env
+    # Запускать и останавливать контейнеры можно только через сокет Docker, а он доступен root.
+    # Доступ к сокету равен правам root на сервере — поэтому он выдан шлюзу, а не оркестратору,
+    # который разбирает чужие файлы.
+    user: root
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as r; r.urlopen('http://127.0.0.1:8001/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - doc-net
+
+networks:
+  doc-net:
+    external: true
