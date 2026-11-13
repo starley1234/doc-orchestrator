@@ -189,7 +189,7 @@ docker compose -f docker-compose.prod.yml up -d --build   # redis и doc-orchest
 | Ollama (Qwen3-VL) | `POST {OLLAMA_URL}/api/chat` — штатный API Ollama; JSON Schema ответа — в поле `format` | `{"message": {"content": "…"}}` |
 
 Контракт Ollama — родной. У штатных серверов остальных движков API другой (docling-serve —
-`POST /v1/convert/file`, MinerU — `POST /v1/file_parse`, PaddleOCR-VL — `POST /layout-parsing`),
+`POST /v1/convert/file`, MinerU 4.x — `POST /v1/file_parse`, PaddleOCR-VL — `POST /layout-parsing`),
 и команд `load` / `unload` у них нет: перед ними нужен тонкий адаптер под контракт из таблицы.
 
 ## Как это устроено
